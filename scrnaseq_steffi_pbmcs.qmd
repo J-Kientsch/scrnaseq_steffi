@@ -1,0 +1,349 @@
+---
+title: "Seurat v5 scRNA-seq — Import → QC → Doublets → SCT v2 → PCA → Harmony → UMAP → Multi-Res Clustering"
+author: "Jacky"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+editor: source
+execute:
+  echo: true
+  warning: true
+  message: true
+---
+
+## 0) Environment
+
+```{r}
+rm(list = ls())
+set.seed(156)
+
+# Deterministic execution
+if (!requireNamespace("future", quietly = TRUE)) install.packages("future")
+future::plan("sequential")
+options(future.globals.maxSize = 110 * 1024^3)
+```
+ 
+## 1) Packages
+
+```{r}
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+library(pacman)
+
+pacman::p_load(
+  Seurat, SeuratObject, Matrix,
+  tidyverse, patchwork,
+  SingleCellExperiment, scater, scuttle, scDblFinder,
+  harmony,
+  svglite
+)
+
+# Optional on-disk backends
+use_bpcells   <- requireNamespace("BPCells", quietly = TRUE)
+use_hdf5array <- requireNamespace("HDF5Array", quietly = TRUE) && requireNamespace("DelayedArray", quietly = TRUE)
+
+theme_set(ggplot2::theme_minimal(base_size = 14))
+```
+
+## 2) Paths & helpers
+
+```{r}
+# I/O
+h5_dir      <- "/home/jacky/scRNASeq_Steffi/data/matrices"
+project_dir <- "/home/jacky/scRNASeq_Steffi/analysis_outputs"
+
+dirs <- c("tables","rds","plots","logs")
+invisible(lapply(dirs, function(d) dir.create(file.path(project_dir, d), recursive = TRUE, showWarnings = FALSE)))
+
+meta_dir  <- file.path(project_dir, "tables")
+rds_dir   <- file.path(project_dir, "rds")
+plots_dir <- file.path(project_dir, "plots")
+
+stop_quiet <- function(cond, msg) { if (!isTRUE(cond)) stop(msg, call. = FALSE) }
+
+save_both <- function(plot_obj, filebase, width = 10, height = 7, dpi = 600) {
+  ggplot2::ggsave(paste0(filebase, ".png"), plot_obj, width = width, height = height, dpi = dpi)
+  ggplot2::ggsave(paste0(filebase, ".svg"), plot_obj, width = width, height = height, dpi = dpi)
+}
+
+make_res_dirs <- function(root, res_label) {
+  res_dir   <- file.path(root, paste0("res_", res_label))
+  d_plots   <- file.path(res_dir, "plots")
+  d_markers <- file.path(res_dir, "markers")
+  d_qc      <- file.path(res_dir, "qc")
+  d_meta    <- file.path(res_dir, "metadata")
+  dir.create(d_plots,   recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_markers, recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_qc,      recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_meta,    recursive = TRUE, showWarnings = FALSE)
+  list(res_dir = res_dir, plots = d_plots, markers = d_markers, qc = d_qc, meta = d_meta)
+}
+
+stop_quiet(dir.exists(h5_dir), paste0("Missing h5_dir: ", h5_dir))
+```
+
+## 3) Discover inputs
+
+```{r}
+pattern_glob <- "*.h5"
+h5_files <- list.files(h5_dir, pattern = utils::glob2rx(pattern_glob), full.names = TRUE, recursive = TRUE)
+stop_quiet(length(h5_files) > 0, paste0("No .h5 files under ", h5_dir))
+
+parse_info <- function(fp){
+  parts <- strsplit(tools::file_path_sans_ext(basename(fp)), "_", fixed = TRUE)[[1]]
+  tibble::tibble(file = fp, sample = paste0(parts[1], "_", parts[2]), donor = parts[1], condition = parts[2])
+}
+info <- purrr::map_dfr(h5_files, parse_info)
+readr::write_csv(info, file.path(meta_dir, "samples_parsed.csv"))
+print(info, n = nrow(info))
+```
+
+## 4) Read & merge
+
+```{r}
+objs <- lapply(seq_len(nrow(info)), function(i){
+  message("Reading: ", basename(info$file[i]))
+  mat <- Read10X_h5(info$file[i])
+  so  <- CreateSeuratObject(counts = mat, project = info$donor[i], min.cells = 3, min.features = 200)
+  so$sample    <- info$sample[i]
+  so$donor     <- info$donor[i]
+  so$condition <- info$condition[i]
+  colnames(so) <- paste(info$sample[i], colnames(so), sep = "_")
+  so
+})
+
+stop_quiet(length(objs) > 0, "No Seurat objects created.")
+obj <- Reduce(function(a, b) merge(a, b), objs)
+obj <- JoinLayers(obj, assay = "RNA")  # ensure single counts layer
+saveRDS(obj, file.path(rds_dir, "00_merged_raw.rds"))
+```
+
+## 5) QC
+
+```{r}
+DefaultAssay(obj) <- "RNA"
+obj[["percent.mt"]]   <- PercentageFeatureSet(obj, pattern = "^MT-")
+obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+
+qc_summary <- obj@meta.data |>
+  tibble::as_tibble(rownames = "cell") |>
+  dplyr::group_by(sample, donor, condition) |>
+  dplyr::summarise(
+    cells         = dplyr::n(),
+    med_counts    = median(nCount_RNA),
+    med_genes     = median(nFeature_RNA),
+    med_percent_mt= median(percent.mt),
+    .groups = "drop"
+  )
+readr::write_csv(qc_summary, file.path(meta_dir, "qc_summary_by_sample.csv"))
+
+p_vln <- VlnPlot(
+  obj, features = c("nFeature_RNA","nCount_RNA","percent.mt","percent.ribo"),
+  group.by = "sample", pt.size = 0.05, ncol = 2
+)
+save_both(p_vln, file.path(plots_dir, "qc_violin_raw"), width = 14, height = 9)
+
+p_sc1 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+p_sc2 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.mt")
+save_both(p_sc1 + p_sc2, file.path(plots_dir, "qc_scatter_raw"), width = 12, height = 6)
+```
+
+## 6) Optional on-disk backend
+
+```{r}
+if (use_bpcells) {
+  counts <- SeuratObject::LayerData(obj[["RNA"]], layer = "counts")
+  bp_dir <- file.path(project_dir, "bp_backend", "RNA_counts")
+  dir.create(bp_dir, recursive = TRUE, showWarnings = FALSE)
+  if ("write_matrix" %in% getNamespaceExports("BPCells")) {
+    bp_counts <- BPCells::write_matrix(counts, dir = bp_dir, name = "counts")
+    obj[["RNA"]] <- SeuratObject::SetAssayData(obj[["RNA"]], layer = "counts", new.data = bp_counts)
+  }
+} else if (use_hdf5array) {
+  library(HDF5Array); library(DelayedArray); library(rhdf5)
+  counts  <- SeuratObject::LayerData(obj[["RNA"]], layer = "counts")
+  h5_path <- file.path(project_dir, "HDF5_backend_counts.h5")
+  if (file.exists(h5_path)) { try({ rhdf5::h5closeAll() }, silent = TRUE); unlink(h5_path) }
+  counts_h5 <- HDF5Array::writeHDF5Array(counts, filepath = h5_path, name = "counts",
+                                         chunkdim = pmin(dim(counts), c(1000,1000)))
+  obj[["RNA"]] <- SeuratObject::SetAssayData(obj[["RNA"]], layer = "counts", new.data = counts_h5)
+}
+```
+
+## 7) Doublets
+
+```{r}
+split_objs <- SplitObject(obj, split.by = "sample")
+
+singlets_list <- list()
+dbl_calls_all <- list()
+
+for (nm in names(split_objs)) {
+  so  <- split_objs[[nm]]
+  sce <- as.SingleCellExperiment(so, assay = "RNA") # raw counts
+  sce <- scuttle::addPerCellQC(sce, subsets = list(Mt = grepl("^MT-", rownames(sce))))
+  sce <- scDblFinder::scDblFinder(sce, samples = NULL, verbose = FALSE)
+  calls <- as.data.frame(SummarizedExperiment::colData(sce))[, c("scDblFinder.class","scDblFinder.score")]
+  calls$cell <- rownames(calls)
+  dbl_calls_all[[nm]] <- calls
+  so$doublet_class <- calls$scDblFinder.class
+  so$doublet_score <- calls$scDblFinder.score
+  singlets_list[[nm]] <- subset(so, subset = doublet_class == "singlet")
+}
+
+obj <- Reduce(function(a, b) merge(a, b), singlets_list)
+obj <- JoinLayers(obj, assay = "RNA")  # re-join after merge
+
+readr::write_csv(dplyr::bind_rows(dbl_calls_all, .id = "sample"),
+                 file.path(meta_dir, "doublet_scores_per_sample.csv"))
+
+saveRDS(obj, file.path(rds_dir, "01_after_doublets.rds"))
+```
+
+## 8) SCTransform v2
+
+```{r}
+DefaultAssay(obj) <- "RNA"
+obj <- SCTransform(
+  object = obj,
+  vst.flavor = "v2",
+  variable.features.n = 3000,
+  vars.to.regress = "percent.mt",
+  method = "glmGamPoi",
+  verbose = TRUE
+)
+stop_quiet(DefaultAssay(obj) == "SCT", "SCT not set as default after SCTransform")
+saveRDS(obj, file.path(rds_dir, "02_sct.rds"))
+```
+
+## 9) PCA
+
+```{r}
+obj <- RunPCA(obj, npcs = 50, verbose = FALSE)
+stop_quiet("pca" %in% names(obj@reductions), "PCA reduction missing")
+
+p_elbow <- ElbowPlot(obj) + labs(title = "PCA Elbow Plot")
+save_both(p_elbow, file.path(plots_dir, "PCA_ElbowPlot"), width = 10, height = 6)
+```
+
+## 10) Harmony
+
+```{r}
+stop_quiet("donor" %in% colnames(obj@meta.data), "Metadata lacks 'donor' column")
+
+obj <- harmony::RunHarmony(
+  object        = obj,
+  group.by.vars = "donor",
+  reduction     = "pca",
+  dims.use      = 1:40,
+  assay.use     = DefaultAssay(obj),
+  verbose       = TRUE
+)
+stop_quiet("harmony" %in% names(obj@reductions), "Harmony reduction missing")
+saveRDS(obj, file.path(rds_dir, "03_after_harmony.rds"))
+```
+
+## 11) UMAP + clustering
+
+```{r}
+dims_use <- 1:30
+obj <- RunUMAP(obj, reduction = "harmony", dims = dims_use)
+obj <- FindNeighbors(obj, reduction = "harmony", dims = dims_use, k.param = 30)
+
+resolutions <- c(0.1, 0.2, 0.5, 0.7, 1.0)
+for (r in resolutions) {
+  obj <- FindClusters(obj, resolution = r, algorithm = 4)  # Leiden
+  nm <- paste0("seurat_clusters_res.", r)
+  obj@meta.data[[nm]] <- Idents(obj)
+}
+saveRDS(obj, file.path(rds_dir, "04_postIntegration_allRes.rds"))
+```
+
+## 12) Per-resolution outputs
+
+```{r}
+DefaultAssay(obj) <- "SCT"
+
+immune_panel <- c(
+  "CCR7","IL7R","LEF1","TCF7","LTB",
+  "CD3D","CD3E","CD3G","CD4","TBX21","CXCR3","IL12RB2","CCR5",
+  "GATA3","CCR4","PTGDR2","RORC","CCR6","IL23R","IL2RA","FOXP3","CTLA4",
+  "CD8A","NKG7","GNLY","GZMB","PRF1",
+  "MS4A1","CD79A","TCL1A","IGHD","CD74",
+  "HLA-DQA1","IGHG1",
+  "LYZ","S100A9","CD14","LGALS3","FCGR3A",
+  "CD1C","FCER1A","CLEC10A","IRF4",
+  "IL3RA","CLEC4C","TCF4"
+)
+
+copy_global_plots <- function(dirs) {
+  for (base in c("qc_violin_raw","qc_scatter_raw","PCA_ElbowPlot")) {
+    for (ext in c(".png",".svg")) {
+      src <- file.path(plots_dir, paste0(base, ext))
+      dest <- if (base == "PCA_ElbowPlot") file.path(dirs$plots, paste0(base, ext)) else file.path(dirs$qc, paste0(base, ext))
+      if (file.exists(src)) file.copy(src, dest, overwrite = TRUE)
+    }
+  }
+}
+
+for (r in c(0.1, 0.2, 0.5, 0.7, 1.0)) {
+  dirs <- make_res_dirs(project_dir, as.character(r))
+  Idents(obj) <- obj@meta.data[[paste0("seurat_clusters_res.", r)]]
+
+  p_umap_clusters <- DimPlot(obj, reduction = "umap", group.by = paste0("seurat_clusters_res.", r),
+                             label = TRUE, repel = TRUE) + ggtitle(paste0("UMAP (res=", r, ")"))
+  p_umap_sample   <- DimPlot(obj, reduction = "umap", group.by = "sample") + ggtitle("UMAP by sample")
+  p_umap_split    <- DimPlot(obj, reduction = "umap", split.by = "sample", label = TRUE, repel = TRUE) +
+                     ggtitle("UMAP split by sample")
+
+  save_both(p_umap_clusters, file.path(dirs$plots, paste0("UMAP_clusters_res", r)), width = 8, height = 6)
+  save_both(p_umap_sample,   file.path(dirs$plots, paste0("UMAP_by_sample_res", r)), width = 8, height = 6)
+  save_both(p_umap_split,    file.path(dirs$plots, paste0("UMAP_split_by_sample_res", r)), width = 14, height = 7)
+
+  markers <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  readr::write_csv(markers, file.path(dirs$markers, paste0("cluster_markers_res", r, ".csv")))
+
+  top_markers <- markers |>
+    dplyr::group_by(cluster) |>
+    dplyr::slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) |>
+    dplyr::pull(gene) |>
+    unique()
+
+  p_heat <- tryCatch({
+    DoHeatmap(obj, features = top_markers, raster = FALSE) + ggtitle(paste0("Top markers heatmap (res=", r, ")"))
+  }, error = function(e) {
+    message("DoHeatmap failed at res=", r, " with: ", e$message)
+    ggplot2::ggplot() + ggtitle(paste0("Heatmap unavailable at res=", r))
+  })
+  save_both(p_heat, file.path(dirs$plots, paste0("Heatmap_top10_markers_res", r)), width = 12, height = 10)
+
+  p_dot <- DotPlot(obj, features = immune_panel) +
+           ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1)) +
+           ggtitle(paste0("Selected immune markers (res=", r, ")"))
+  save_both(p_dot, file.path(dirs$plots, paste0("DotPlot_selected_markers_res", r)), width = 14, height = 10)
+
+  meta_res <- obj@meta.data |>
+    dplyr::mutate(cluster = as.character(.data[[paste0("seurat_clusters_res.", r)]]))
+  prop_tbl <- meta_res |>
+    dplyr::count(donor, condition, cluster, name = "cells") |>
+    dplyr::group_by(donor, condition) |>
+    dplyr::mutate(prop = cells / sum(cells)) |>
+    dplyr::ungroup()
+  readr::write_csv(prop_tbl, file.path(dirs$meta, paste0("proportions_by_donor_condition_res", r, ".csv")))
+  utils::write.csv(meta_res, file.path(dirs$meta, paste0("metadata_res", r, ".csv")), row.names = TRUE)
+
+  copy_global_plots(dirs)
+}
+```
+
+## 13) Save & session info
+
+```{r}
+saveRDS(obj, file.path(rds_dir, "04_final_object_multiRes.rds"))
+writeLines(capture.output(sessionInfo()), con = file.path(project_dir, "sessionInfo_full.txt"))
+cat("\\n✅ Done. Outputs in: ", project_dir,
+    "\\n- rds/: 00_merged_raw.rds → 04_final_object_multiRes.rds",
+    "\\n- tables/: parsed samples, QC summaries, doublet calls, proportions per res",
+    "\\n- res_*/: per-resolution plots (PNG+SVG, 600 dpi), markers, metadata\\n", sep = "")
+```

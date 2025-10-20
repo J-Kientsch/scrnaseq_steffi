@@ -1,0 +1,385 @@
+---
+title: "scRNASeq analysis for Steffi - PBMCs"
+author: "Jacky K"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+editor: source
+execute:
+  echo: true
+  warning: true
+  message: true
+---
+
+## Overview
+
+
+
+```{r}
+suppressPackageStartupMessages({
+  if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+  library(pacman)
+})
+
+# CRAN + Bioconductor package management
+options(repos = c(CRAN = "https://cran.r-project.org"))
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+# Load (and install if needed) packages
+pacman::p_load(
+  Seurat, 
+  SeuratObject,
+  tidyverse, 
+  patchwork,        
+  future,                      
+  harmony,                     
+  SingleCellExperiment,        
+  svglite)
+
+# Bioc packages (install if missing)
+if (!requireNamespace("scater", quietly = TRUE)) BiocManager::install("scater", ask = FALSE, update = FALSE)
+if (!requireNamespace("scDblFinder", quietly = TRUE)) BiocManager::install("scDblFinder", ask = FALSE, update = FALSE)
+
+library(scater)
+library(scDblFinder)
+
+set.seed(156)                                   # Reproducibility
+
+future::plan("sequential")                      # Deterministic
+options(future.globals.maxSize = 110 * 1024^3)  
+theme_set(theme_minimal(base_size = 14))
+```
+
+## 2) Paths, project folders, and helpers
+
+```{r}
+# Input & project name
+input_dir <- "/home/jacky/scRNASeq_Steffi/data"
+project   <- "pbmcs_steffi"
+
+# Output roots
+out_root  <- "/home/jacky/scRNASeq_Steffi/analysis"
+out_dir   <- file.path(out_root, project)
+plots_dir <- file.path(out_dir, "plots")
+meta_dir  <- file.path(out_dir, "metadata")
+rds_dir   <- file.path(out_dir, "rds")
+
+dir.create(out_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(plots_dir,recursive = TRUE, showWarnings = FALSE)
+dir.create(meta_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(rds_dir,  recursive = TRUE, showWarnings = FALSE)
+
+# Helper: fail fast with message
+stop_quiet <- function(cond, msg) { if (!isTRUE(cond)) stop(msg, call. = FALSE) }
+
+# Helper: parse donor/condition from DONOR_CONDITION_*.h5
+parse_info <- function(fp) {
+  bn    <- basename(fp)
+  core  <- tools::file_path_sans_ext(bn)
+  parts <- strsplit(core, "_", fixed = TRUE)[[1]]
+  donor <- dplyr::na_if(parts[1], "")
+  condition <- if (length(parts) >= 2) parts[2] else NA_character_
+  tibble::tibble(file = fp, sample = core, donor = donor, condition = condition)
+}
+
+# Helper: save plot as PNG and SVG (600 dpi for PNG)
+save_both <- function(plot_obj, filebase, width = 10, height = 7, dpi = 600) {
+  ggplot2::ggsave(paste0(filebase, ".png"), plot_obj, width = width, height = height, dpi = dpi)
+  ggplot2::ggsave(paste0(filebase, ".svg"), plot_obj, width = width, height = height, dpi = dpi)
+}
+
+# Helper: ensure per-resolution directory tree exists
+make_res_dirs <- function(root, res_label) {
+  res_dir   <- file.path(root, paste0("res_", res_label))
+  d_plots   <- file.path(res_dir, "plots")
+  d_markers <- file.path(res_dir, "markers")
+  d_qc      <- file.path(res_dir, "qc")
+  d_meta    <- file.path(res_dir, "metadata")
+  dir.create(d_plots,   recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_markers, recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_qc,      recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_meta,    recursive = TRUE, showWarnings = FALSE)
+  list(res_dir = res_dir, plots = d_plots, markers = d_markers, qc = d_qc, meta = d_meta)
+}
+```
+
+## 3) Discover .h5 files and parse sample metadata
+
+```{r}
+h5_files <- list.files(input_dir, pattern = "*.h5$", full.names = TRUE, recursive = TRUE)
+stop_quiet(length(h5_files) > 0, paste0("No .h5 files found under ", input_dir))
+
+info <- purrr::map_dfr(h5_files, parse_info)
+stop_quiet(all(!is.na(info$donor)) & all(!is.na(info$condition)),
+           "Expected file naming: DONOR_CONDITION_*.h5 (e.g., NB166_il18_xxx.h5)")
+readr::write_csv(info, file.path(meta_dir, "samples_parsed.csv"))
+print(info)
+```
+
+## 4) Load HDF5 into Seurat objects and merge
+
+```{r}
+objs <- vector("list", nrow(info))
+for (i in seq_len(nrow(info))) {
+  message("Reading: ", basename(info$file[i]))
+  mat <- Read10X_h5(info$file[i])
+  so  <- CreateSeuratObject(counts = mat, project = info$donor[i], min.cells = 3, min.features = 200)
+  so$sample    <- info$sample[i]
+  so$donor     <- info$donor[i]
+  so$condition <- info$condition[i]
+  colnames(so) <- paste(info$sample[i], colnames(so), sep = "_")  # stable IDs
+  objs[[i]]    <- so
+}
+stop_quiet(length(objs) > 0, "No Seurat objects created.")
+obj <- Reduce(function(a, b) merge(a, b), objs)
+stop_quiet(inherits(obj, "Seurat"), "Merged object is not Seurat.")
+
+# Save raw metadata snapshot
+utils::write.csv(obj@meta.data, file.path(meta_dir, "metadata_raw.csv"))
+dim(obj)
+```
+
+## 5) QC metrics (mito/ribo) & initial plots
+
+```{r}
+DefaultAssay(obj) <- "RNA"
+obj[["percent.mt"]]   <- PercentageFeatureSet(obj, pattern = "^MT-")
+obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+
+# Violin plots (by sample) for quick inspection
+p_vln_raw <- VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"),
+                     group.by = "sample", pt.size = 0.05, ncol = 2)
+save_both(p_vln_raw, file.path(plots_dir, "qc_violin_raw"), width = 14, height = 9)
+
+# Scatter overview
+p_scatter_raw <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+                 FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.mt")
+save_both(p_scatter_raw, file.path(plots_dir, "qc_scatter_raw"), width = 12, height = 6)
+```
+
+## 6) Data-driven QC filtering with scater::isOutlier (+ guardrails)
+
+```{r}
+# Convert to SCE for data-driven outlier detection
+sce <- as.SingleCellExperiment(obj, assay = "RNA")
+colData(sce)$nFeature_RNA <- obj$nFeature_RNA
+colData(sce)$nCount_RNA   <- obj$nCount_RNA
+colData(sce)$percent.mt   <- obj$percent.mt
+colData(sce)$percent.ribo <- obj$percent.ribo
+
+# Per-sample robust thresholds
+by_sample <- split(seq_len(ncol(sce)), obj$sample)
+keep_idx <- rep(TRUE, ncol(sce))
+
+for (s in names(by_sample)) {
+  idx <- by_sample[[s]]
+  # Define outliers: low features / high mito
+  out_low_feat <- isOutlier(colData(sce)$nFeature_RNA[idx], type = "lower", log = TRUE, nmads = 3)
+  out_high_mt  <- isOutlier(colData(sce)$percent.mt[idx], type = "higher", nmads = 3)
+  # Guardrails
+  out_high_mt  <- out_high_mt | (colData(sce)$percent.mt[idx] > 12)
+  out_low_feat <- out_low_feat | (colData(sce)$nFeature_RNA[idx] < 200)
+  keep_idx[idx] <- !(out_low_feat | out_high_mt)
+}
+message("Retaining cells: ", sum(keep_idx), " / ", length(keep_idx))
+obj <- subset(obj, cells = colnames(obj)[keep_idx])
+stop_quiet(ncol(obj) > 0, "All cells filtered out; adjust QC thresholds.")
+
+# Post-QC snapshot
+utils::write.csv(obj@meta.data, file.path(meta_dir, "metadata_post_qc.csv"))
+p_vln_post <- VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"),
+                      group.by = "sample", pt.size = 0.05, ncol = 2)
+save_both(p_vln_post, file.path(plots_dir, "qc_violin_postQC"), width = 14, height = 9)
+```
+
+## 7) Doublet detection with scDblFinder (per sample)
+
+```{r}
+# Run per-sample to avoid cross-sample confounding
+split_objs <- SplitObject(obj, split.by = "sample")
+dbl_calls <- list()
+clean_list <- list()
+
+for (nm in names(split_objs)) {
+  so <- split_objs[[nm]]
+  sce <- as.SingleCellExperiment(so, assay = "RNA")  # use raw counts
+  sce <- scDblFinder(sce, samples = NULL, verbose = FALSE)
+  calls <- as.data.frame(colData(sce))[, c("scDblFinder.class", "scDblFinder.score")]
+  calls$cell <- rownames(calls)
+  dbl_calls[[nm]] <- calls
+  so$doublet_class <- calls$scDblFinder.class
+  so$doublet_score <- calls$scDblFinder.score
+  clean_list[[nm]] <- subset(so, subset = doublet_class == "singlet")
+}
+
+obj <- Reduce(function(a,b) merge(a,b), clean_list)
+utils::write.csv(obj@meta.data, file.path(meta_dir, "metadata_post_doublet.csv"))
+message("Cells after doublet removal: ", ncol(obj))
+```
+
+## 8) SCTransform v2 normalization
+
+```{r}
+DefaultAssay(obj) <- "RNA"
+obj <- SCTransform(
+  object = obj,
+  vst.flavor = "v2",
+  variable.features.n = 3000,
+  vars.to.regress = "percent.mt",
+  method = "glmGamPoi",
+  verbose = TRUE
+)
+stop_quiet(DefaultAssay(obj) == "SCT", "SCT assay not set as default after SCTransform.")
+stop_quiet(all(c("counts","data") %in% names(obj[["SCT"]]@layers)), "SCT layered assay missing expected layers.")
+```
+
+## 9) PCA and elbow plot
+
+```{r}
+obj <- RunPCA(obj, npcs = 50, verbose = FALSE)
+stop_quiet("pca" %in% names(obj@reductions), "PCA reduction missing.")
+
+p_elbow <- ElbowPlot(obj) + labs(title = "PCA Elbow Plot")
+save_both(p_elbow, file.path(plots_dir, "PCA_ElbowPlot"), width = 10, height = 6)
+```
+
+## 10) Harmony integration on donor
+
+```{r}
+stop_quiet("donor" %in% colnames(obj@meta.data), "Metadata lacks 'donor' column.")
+obj <- RunHarmony(
+  object        = obj,
+  group.by.vars = "donor",
+  reduction     = "pca",
+  dims.use      = 1:50,
+  verbose       = TRUE
+)
+stop_quiet("harmony" %in% names(obj@reductions), "Harmony reduction missing.")
+```
+
+## 11) UMAP, neighbors, and clustering (multi-resolution)
+
+```{r}
+dims_use <- 1:30
+obj <- RunUMAP(obj, reduction = "harmony", dims = dims_use)
+obj <- FindNeighbors(obj, reduction = "harmony", dims = dims_use, k.param = 30)
+
+# Store multiple resolutions
+resolutions <- c(0.1, 0.2, 0.5, 0.7, 1.0)
+for (r in resolutions) {
+  obj <- FindClusters(obj, resolution = r, algorithm = 4)  # Leiden
+  nm <- paste0("seurat_clusters_res.", r)
+  obj@meta.data[[nm]] <- Idents(obj)
+}
+```
+
+## 12) Per-resolution outputs: UMAPs, markers, heatmaps, dotplots, QC copies, metadata
+
+```{r}
+DefaultAssay(obj) <- "SCT"
+
+# Selected immune panel (edit as needed)
+panel <- c(
+  "CCR7","IL7R","LEF1","TCF7","LTB",
+  "CD3D","CD3E","CD3G","CD4","TBX21","CXCR3","IL12RB2","CCR5",
+  "GATA3","CCR4","PTGDR2","RORC","CCR6","IL23R","IL2RA","FOXP3","CTLA4",
+  "CD8A","NKG7","GNLY","GZMB","PRF1",
+  "MS4A1","CD79A","TCL1A","IGHD","CD74",
+  "HLA-DQA1","IGHG1",
+  "LYZ","S100A9","CD14","LGALS3","FCGR3A",
+  "CD1C","FCER1A","CLEC10A","IRF4",
+  "IL3RA","CLEC4C","TCF4"
+)
+
+# Loop over resolutions and write outputs to subfolders
+resolutions <- c(0.1, 0.2, 0.5, 0.7, 1.0)
+for (r in resolutions) {
+  res_lab <- as.character(r)
+  dirs <- make_res_dirs(out_dir, res_lab)
+
+  # Set identities
+  Idents(obj) <- obj@meta.data[[paste0("seurat_clusters_res.", r)]]
+
+  # UMAPs
+  p_umap_clusters <- DimPlot(obj, reduction = "umap", group.by = paste0("seurat_clusters_res.", r),
+                             label = TRUE, repel = TRUE) + ggtitle(paste0("UMAP (res=", r, ")"))
+  p_umap_sample   <- DimPlot(obj, reduction = "umap", group.by = "sample") + ggtitle("UMAP by sample")
+  p_umap_split    <- DimPlot(obj, reduction = "umap", split.by = "sample", label = TRUE, repel = TRUE) +
+                     ggtitle("UMAP split by sample")
+
+  save_both(p_umap_clusters, file.path(dirs$plots, paste0("UMAP_clusters_res", r)), width = 8, height = 6)
+  save_both(p_umap_sample,   file.path(dirs$plots, paste0("UMAP_by_sample_res", r)), width = 8, height = 6)
+  save_both(p_umap_split,    file.path(dirs$plots, paste0("UMAP_split_by_sample_res", r)), width = 14, height = 7)
+
+  # Markers per resolution
+  markers <- FindAllMarkers(
+    obj,
+    only.pos        = TRUE,
+    min.pct         = 0.25,
+    logfc.threshold = 0.25
+  )
+  readr::write_csv(markers, file.path(dirs$markers, paste0("cluster_markers_res", r, ".csv")))
+
+  # Heatmap: top markers per cluster (top 10 by avg_log2FC)
+  top_markers <- markers |>
+    group_by(cluster) |>
+    slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) |>
+    pull(gene) |>
+    unique()
+
+  # DoHeatmap can be heavy; limit to variable features present
+  p_heat <- tryCatch({
+    DoHeatmap(obj, features = top_markers, raster = FALSE) + ggtitle(paste0("Top markers heatmap (res=", r, ")"))
+  }, error = function(e) {
+    message("DoHeatmap failed at res=", r, " with: ", e$message)
+    ggplot() + ggtitle(paste0("Heatmap unavailable at res=", r))
+  })
+  save_both(p_heat, file.path(dirs$plots, paste0("Heatmap_top10_markers_res", r)), width = 12, height = 10)
+
+  # DotPlot for selected panel
+  p_dot <- DotPlot(obj, features = panel) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+          ggtitle(paste0("Selected immune markers (res=", r, ")"))
+  save_both(p_dot, file.path(dirs$plots, paste0("DotPlot_selected_markers_res", r)), width = 14, height = 10)
+
+  # Proportions by donor/condition
+  meta_res <- obj@meta.data |>
+    dplyr::mutate(cluster = as.character(obj@meta.data[[paste0("seurat_clusters_res.", r)]]))
+  prop_tbl <- meta_res |>
+    count(donor, condition, cluster, name = "cells") |>
+    group_by(donor, condition) |>
+    mutate(prop = cells / sum(cells)) |>
+    ungroup()
+  readr::write_csv(prop_tbl, file.path(dirs$meta, paste0("proportions_by_donor_condition_res", r, ".csv")))
+
+  # Metadata dump (includes cluster column for this res)
+  meta_dump <- meta_res
+  utils::write.csv(meta_dump, file.path(dirs$meta, paste0("metadata_res", r, ".csv")), row.names = TRUE)
+
+  # Copy QC & Elbow into each res folder for convenience
+  qc_srcs <- c("qc_violin_raw", "qc_scatter_raw", "qc_violin_postQC")
+  for (base in qc_srcs) {
+    for (ext in c(".png",".svg")) {
+      src <- file.path(plots_dir, paste0(base, ext))
+      if (file.exists(src)) file.copy(src, file.path(dirs$qc, paste0(base, ext)), overwrite = TRUE)
+    }
+  }
+  for (ext in c(".png",".svg")) {
+    src <- file.path(plots_dir, paste0("PCA_ElbowPlot", ext))
+    if (file.exists(src)) file.copy(src, file.path(dirs$plots, paste0("PCA_ElbowPlot_res", r, ext)), overwrite = TRUE)
+  }
+}
+```
+
+## 13) Save final object and session info
+
+```{r}
+saveRDS(obj, file.path(rds_dir, paste0(project, ".rds")))
+
+# Session info is invaluable for reproducibility
+si <- utils::capture.output(sessionInfo())
+writeLines(si, con = file.path(out_dir, "sessionInfo.txt"))
+
+cat("\nDone. Outputs written to: ", out_dir, "\nPer-resolution folders created: res_0.1, res_0.2, res_0.5, res_0.7, res_1.0\n", sep = "")
+```
