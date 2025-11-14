@@ -1,0 +1,926 @@
+---
+title: "scRNASeq_Steffi_PBMCs"
+author: "Jacky K"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+editor: source
+
+execute:
+  echo: true
+  warning: true
+  message: true
+---
+
+## 0) Environment
+
+```{r}
+rm(list = ls())
+set.seed(156)
+if (!requireNamespace("future", quietly = TRUE)) install.packages("future")
+future::plan("sequential")
+options(future.globals.maxSize = 110 * 1024^3)
+```
+
+## 1) Packages
+
+```{r}
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+library(pacman)
+
+pacman::p_load(
+  Seurat, SeuratObject, Matrix,
+  tidyverse, patchwork,
+  SingleCellExperiment, scater, scuttle, scDblFinder,
+  harmony,
+  svglite,
+  BiocParallel,
+  glmGamPoi
+)
+
+use_bpcells   <- requireNamespace("BPCells", quietly = TRUE)
+use_hdf5array <- requireNamespace("HDF5Array", quietly = TRUE) && requireNamespace("DelayedArray", quietly = TRUE)
+have_lisi     <- requireNamespace("lisi", quietly = TRUE)
+
+have_leiden <- requireNamespace("reticulate", quietly = TRUE) &&
+               tryCatch(reticulate::py_module_available("leidenalg"), error = function(e) FALSE)
+algo <- if (have_leiden) 4 else 3
+
+immune_panel <- c(
+  "CCR7","IL7R","LEF1","TCF7","LTB",
+  "CD3D","CD3E","CD3G","CD4","TBX21","CXCR3","IL12RB2","CCR5",
+  "GATA3","CCR4","PTGDR2","RORC","CCR6","IL23R","IL2RA","FOXP3","CTLA4",
+  "CD8A","NKG7","GNLY","GZMB","PRF1",
+  "MS4A1","CD79A","TCL1A","IGHD","CD74",
+  "HLA-DQA1","IGHG1",
+  "LYZ","S100A9","CD14","LGALS3","FCGR3A",
+  "CD1C","FCER1A","CLEC10A","IRF4",
+  "IL3RA","CLEC4C","TCF4"
+)
+parallel <- BiocParallel::MulticoreParam(workers = 1)
+BiocParallel::register(parallel)
+
+theme_set(ggplot2::theme_minimal(base_size = 14))
+
+# Unified saver: defaults set to 600 dpi, width=16, height=9 (user requested)
+save_both <- function(plot_obj, filebase, width = 16, height = 9, dpi = 600, bg = "white") {
+  ggplot2::ggsave(paste0(filebase, ".png"), plot_obj, width = width, height = height, dpi = dpi, bg = bg)
+  ggplot2::ggsave(paste0(filebase, ".svg"), plot_obj, width = width, height = height, dpi = dpi, bg = bg)
+}
+```
+
+## 2) Paths & helpers
+
+```{r}
+h5_dir      <- "/home/jacky/scRNASeq_Steffi/filtered_matrices"
+project_dir <- "/home/jacky/scRNASeq_Steffi/analysis_outputs_downsample1000"
+
+for (d in c("tables","rds","plots","logs")) dir.create(file.path(project_dir, d), recursive = TRUE, showWarnings = FALSE)
+
+meta_dir  <- file.path(project_dir, "tables")
+rds_dir   <- file.path(project_dir, "rds")
+plots_dir <- file.path(project_dir, "plots")
+
+stop_quiet <- function(cond, msg) { if (!isTRUE(cond)) stop(msg, call. = FALSE) }
+
+make_res_dirs <- function(root, res_label) {
+  res_dir   <- file.path(root, paste0("res_", res_label))
+  d_plots   <- file.path(res_dir, "plots")
+  d_markers <- file.path(res_dir, "markers")
+  d_qc      <- file.path(res_dir, "qc")
+  d_meta    <- file.path(res_dir, "metadata")
+  dir.create(d_plots,   recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_markers, recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_qc,      recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_meta,    recursive = TRUE, showWarnings = FALSE)
+  list(res_dir = res_dir, plots = d_plots, markers = d_markers, qc = d_qc, meta = d_meta)
+}
+
+sample_pal <- function(x) {
+  f <- factor(x)
+  out <- tryCatch(grDevices::hcl.colors(nlevels(f), palette = "Set2"),
+                  error = function(e) grDevices::hcl.colors(nlevels(f)))
+  out
+}
+
+stop_quiet(dir.exists(h5_dir), paste0("Missing h5_dir: ", h5_dir))
+```
+
+
+## 3) Discover inputs
+
+```{r}
+h5_files <- list.files(h5_dir, pattern = "*.h5$", full.names = TRUE, recursive = TRUE)
+stop_quiet(length(h5_files) > 0, paste0("No .h5 files under ", h5_dir))
+
+parse_info <- function(fp){
+  parts <- strsplit(tools::file_path_sans_ext(basename(fp)), "_", fixed = TRUE)[[1]]
+  tibble::tibble(file = fp, sample = paste0(parts[1], "_", parts[2]), donor = parts[1], condition = parts[2])
+}
+info <- purrr::map_dfr(h5_files, parse_info)
+readr::write_csv(info, file.path(meta_dir, "samples_parsed.csv"))
+print(info, n = nrow(info))
+```
+
+## 4) Read & merge
+
+```{r}
+objs <- lapply(seq_len(nrow(info)), function(i){
+  message("Reading: ", basename(info$file[i]))
+  mat <- Read10X_h5(info$file[i])
+  so  <- CreateSeuratObject(counts = mat, project = info$donor[i], min.cells = 3, min.features = 200)
+  so$sample    <- info$sample[i]
+  so$donor     <- info$donor[i]
+  so$condition <- info$condition[i]
+  colnames(so) <- paste(info$sample[i], colnames(so), sep = "_")
+  so
+})
+
+stop_quiet(length(objs) > 0, "No Seurat objects created.")
+obj <- Reduce(function(a, b) merge(a, b), objs)
+obj <- JoinLayers(obj, assay = "RNA")
+stop_quiet(inherits(obj, "Seurat"), "obj not Seurat after merge")
+saveRDS(obj, file.path(rds_dir, "00_merged_raw.rds"))
+```
+
+## check immune panel
+
+```{r}
+intersect(immune_panel, rownames(obj))
+```
+
+## downsample the SO for speed
+
+```{r}
+orig_idents <- Idents(obj)
+Idents(obj)  <- obj$sample
+obj          <- subset(x = obj, downsample = 1000)
+Idents(obj)  <- orig_idents
+message("Cells after per-sample downsample: ", ncol(obj))
+```
+
+## 5) QC visuals (pre-filter)
+
+```{r}
+DefaultAssay(obj) <- "RNA"
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+ribolist <- grep("^RP[SL]", rownames(obj), value = TRUE)
+ribolist_clean <- setdiff(ribolist, c("RPS19BP1", "RPS6KA3", "RPS6KA2-AS1"))
+obj[["percent.ribo"]] <- PercentageFeatureSet(obj, features = ribolist_clean)
+
+obj$sample <- factor(obj$sample)
+pal <- sample_pal(obj$sample)
+
+qc_feats <- c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo")
+qc_titles <- c(
+  nFeature_RNA = "Genes per cell",
+  nCount_RNA   = "Unique molecular identifiers (UMIs) per cell",
+  `percent.mt` = "Mitochondrial percentage",
+  `percent.ribo` = "Ribosomal percentage"
+)
+
+mk_vln <- function(feat) {
+  p <- VlnPlot(
+    obj, features = feat, group.by = "sample", cols = pal, pt.size = 0
+  ) +
+    ggplot2::stat_summary(
+      fun.data = function(y) data.frame(y = mean(y), ymin = mean(y), ymax = mean(y)),
+      geom = "errorbar", width = 0.15, linewidth = 0.35, color = "black"
+    ) +
+    ggplot2::ggtitle(qc_titles[[feat]]) +
+    ggplot2::theme_minimal(base_size = 14) +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, vjust = 1),
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.grid.major.x = ggplot2::element_blank(),
+      strip.text = ggplot2::element_text(face = "bold"),
+      plot.title = ggplot2::element_text(face = "bold"),
+      legend.position = "none",
+      axis.title.x = ggplot2::element_blank(),
+      axis.title.y = ggplot2::element_blank()
+    )
+  if (feat == "percent.mt") p <- p + ggplot2::coord_cartesian(ylim = c(0, 25))
+  if (feat == "nCount_RNA") p <- p + ggplot2::coord_cartesian(ylim = c(0, 75000))
+  p
+}
+
+plots <- lapply(qc_feats, mk_vln)
+p_vln <- (plots[[1]] | plots[[2]]) / (plots[[3]] | plots[[4]])
+p_vln <- p_vln + patchwork::plot_annotation(title = "QC metrics per sample (means shown)")
+save_both(p_vln, file.path(plots_dir, "qc_violin_raw_final"))
+
+p_sc1 <- FeatureScatter(
+  obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", pt.size = 0.2
+) +
+  ggplot2::labs(
+    title = "Genes vs UMIs per cell",
+    x = "Unique molecular identifiers (UMIs) per cell",
+    y = "Genes detected per cell"
+  ) +
+  ggplot2::scale_x_continuous(labels = scales::comma, limits = c(0, 75000)) +
+  ggplot2::theme_minimal(base_size = 14) +
+  ggplot2::theme(legend.position = "none")
+
+p_sc2 <- FeatureScatter(
+  obj, feature1 = "nCount_RNA", feature2 = "percent.mt", pt.size = 0.2
+) +
+  ggplot2::labs(
+    title = "Mitochondrial % vs UMIs per cell",
+    x = "Unique molecular identifiers (UMIs) per cell",
+    y = "Mitochondrial percent"
+  ) +
+  ggplot2::scale_x_continuous(labels = scales::comma, limits = c(0, 75000)) +
+  ggplot2::scale_y_continuous(limits = c(0, 25)) +
+  ggplot2::theme_minimal(base_size = 14) +
+  ggplot2::theme(legend.position = "none")
+
+save_both(p_sc1 + p_sc2, file.path(plots_dir, "qc_scatter_raw_labeled"))
+```
+
+## 6) on-disk backend
+
+```{r}
+if (use_bpcells || use_hdf5array) {
+  counts <- SeuratObject::LayerData(obj[["RNA"]], layer = "counts")
+}
+
+if (use_bpcells) {
+  bp_dir <- file.path(project_dir, "bp_backend", "RNA_counts")
+  if (dir.exists(bp_dir)) unlink(bp_dir, recursive = TRUE)
+  dir.create(bp_dir, recursive = TRUE, showWarnings = FALSE)
+
+  BPCells::write_matrix_dir(mat = counts, dir = bp_dir, overwrite = TRUE)
+  SeuratObject::LayerData(obj[["RNA"]], layer = "counts") <- BPCells::open_matrix_dir(dir = bp_dir)
+  message("BPCells counts layer active")
+} else if (use_hdf5array) {
+  if (!requireNamespace("rhdf5", quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+    BiocManager::install("rhdf5", ask = FALSE, update = FALSE)
+  }
+  library(HDF5Array); library(DelayedArray)
+  h5_path <- file.path(project_dir, "HDF5_backend_counts.h5")
+  if (file.exists(h5_path)) { try({ rhdf5::h5closeAll() }, silent = TRUE); unlink(h5_path) }
+  counts_h5 <- HDF5Array::writeHDF5Array(
+    counts,
+    filepath = h5_path,
+    name = "counts",
+    chunkdim = pmin(dim(counts), c(1000, 1000))
+  )
+  SeuratObject::LayerData(obj[["RNA"]], layer = "counts") <- counts_h5
+  message("HDF5Array counts layer active")
+}
+```
+
+## 7) Doublets
+
+```{r}
+# If you wish to run the per-sample scDblFinder loop, uncomment and run the block below.
+# dbl_calls_all <- list()
+# split_objs <- SplitObject(obj, split.by = "sample")
+# singlets_list <- list()
+# for (nm in names(split_objs)) {
+#   so  <- split_objs[[nm]]
+#   sce <- as.SingleCellExperiment(so, assay = "RNA")
+#   sce <- scuttle::addPerCellQC(sce, subsets = list(Mt = grepl("^MT-", rownames(sce))))
+#   sce <- scDblFinder::scDblFinder(sce, samples = NULL, verbose = FALSE, BPPARAM = parallel)
+#   calls <- as.data.frame(SummarizedExperiment::colData(sce))
+#   calls$cell <- rownames(calls)
+#   so$doublet_class <- factor(calls$scDblFinder.class)
+#   so$doublet_score <- as.numeric(calls$scDblFinder.score)
+#   singlets_list[[nm]] <- subset(so, subset = doublet_class == "singlet")
+#   dbl_calls_all[[nm]] <- calls
+# }
+
+# If you do not run the loop above, keep the rest commented or adapted accordingly.
+```
+
+## 8) QC filtering with outliers
+
+```{r}
+is_outlier_local <- function(x, nmads = 3, type = c("both", "lower", "higher")) {
+  type <- match.arg(type)
+  out <- scater::isOutlier(x, nmads = nmads, type = type, log = FALSE)
+  out[is.na(out)] <- FALSE
+  out
+}
+
+cells_keep <- (!is_outlier_local(obj$nFeature_RNA, type = "lower")) &
+              (!is_outlier_local(obj$nCount_RNA,   type = "higher")) &
+              (!is_outlier_local(obj$percent.mt,   type = "higher")) &
+              (!is_outlier_local(obj$percent.ribo, type = "higher"))
+cells_keep[is.na(cells_keep)] <- FALSE
+
+obj <- subset(obj, cells = colnames(obj)[cells_keep])
+stop_quiet(inherits(obj, "Seurat"), "obj not Seurat after QC filter")
+saveRDS(obj, file.path(rds_dir, "01b_after_qc_filter.rds"))
+
+obj$sample <- factor(obj$sample)
+pal <- sample_pal(obj$sample)
+qc_feats <- c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo")
+qc_titles <- c(
+  nFeature_RNA = "Genes per cell",
+  nCount_RNA   = "Unique molecular identifiers (UMIs) per cell",
+  `percent.mt` = "Mitochondrial percentage",
+  `percent.ribo` = "Ribosomal percentage"
+)
+
+mk_vln_filt <- function(feat) {
+  p <- VlnPlot(obj, features = feat, group.by = "sample", cols = pal, pt.size = 0) +
+    ggplot2::stat_summary(
+      fun.data = function(y) data.frame(y = mean(y), ymin = mean(y), ymax = mean(y)),
+      geom = "errorbar", width = 0.15, linewidth = 0.35, color = "black"
+    ) +
+    ggplot2::ggtitle(qc_titles[[feat]]) +
+    ggplot2::theme_minimal(base_size = 14) +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, vjust = 1),
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.grid.major.x = ggplot2::element_blank(),
+      strip.text = ggplot2::element_text(face = "bold"),
+      plot.title = ggplot2::element_text(face = "bold"),
+      legend.position = "none",
+      axis.title.x = ggplot2::element_blank(),
+      axis.title.y = ggplot2::element_blank()
+    )
+  if (feat == "percent.mt")  p <- p + ggplot2::coord_cartesian(ylim = c(0, 25))
+  if (feat == "nCount_RNA")  p <- p + ggplot2::coord_cartesian(ylim = c(0, 75000))
+  p
+}
+
+plots_f <- lapply(qc_feats, mk_vln_filt)
+p_vln_f <- (plots_f[[1]] | plots_f[[2]]) / (plots_f[[3]] | plots_f[[4]])
+p_vln_f <- p_vln_f + patchwork::plot_annotation(title = "QC metrics per sample (after outlier filtering, means shown)")
+save_both(p_vln_f, file.path(plots_dir, "qc_violin_after_filter"))
+
+p_sc1_f <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", pt.size = 0.2) +
+  ggplot2::labs(title = "Genes vs UMIs per cell (filtered)", x = "UMIs per cell", y = "Genes detected per cell") + ggplot2::scale_x_continuous(labels = scales::comma, limits = c(0, 75000)) + ggplot2::theme_minimal(base_size = 14) + ggplot2::theme(legend.position = "none")
+
+p_sc2_f <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.mt", pt.size = 0.2) +
+  ggplot2::labs(title = "Mitochondrial % vs UMIs per cell (filtered)", x = "UMIs per cell", y = "Mitochondrial percent") + ggplot2::scale_x_continuous(labels = scales::comma, limits = c(0, 75000)) + ggplot2::scale_y_continuous(limits = c(0, 25)) + ggplot2::theme_minimal(base_size = 14) + ggplot2::theme(legend.position = "none")
+
+save_both(p_sc1_f + p_sc2_f, file.path(plots_dir, "qc_scatter_after_filter"))
+```
+
+## 9) SCTransform v2
+
+```{r}
+
+DefaultAssay(obj) <- "RNA"
+obj <- SCTransform(
+  object = obj,
+  vst.flavor = "v2",
+  variable.features.n = 2000,
+  method = "glmGamPoi"
+)
+stop_quiet(DefaultAssay(obj) == "SCT", "SCT not set as default after SCTransform")
+saveRDS(obj, file.path(rds_dir, "02_sct.rds"))
+```
+
+## 10) PCA
+
+```{r} 
+
+```{r}
+## 10) PCA (fully fixed & polished)
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(patchwork)
+library(readr)
+
+message("Running PCA (npcs = 50)...")
+obj <- RunPCA(obj, npcs = 50, verbose = FALSE)
+stopifnot("pca" %in% names(obj@reductions))
+
+# ---------- shared styling ----------
+
+shared_base <- 14
+shared_theme <- theme_minimal(base_size = shared_base) +
+theme(
+plot.title = element_text(face = "bold", size = shared_base + 2, hjust = 0.5),
+axis.title = element_text(size = shared_base - 1),
+axis.text = element_text(size = shared_base - 2),
+panel.grid.major = element_line(color = "grey90", size = 0.35),
+panel.grid.minor = element_blank()
+)
+
+# ---------- 1) Classic elbow ----------
+
+p_elbow <- tryCatch({
+ElbowPlot(obj, ndims = 50) +
+labs(title = "Classic PCA elbow (SD)") +
+shared_theme + theme(plot.title = element_text(face = "bold", size = shared_base + 2))
+}, error = function(e) {
+sdev_fallback <- if (!is.null(obj@reductions$pca@stdev)) as.numeric(obj@reductions$pca@stdev) else stop("ElbowPlot failed and no sdev fallback.")
+df_sd <- tibble(PC = seq_along(sdev_fallback), SD = sdev_fallback)
+ggplot(df_sd, aes(PC, SD)) + geom_point(size = 1.8) + geom_line() +
+labs(title = "Classic PCA elbow (SD)", x = "PC", y = "Standard deviation") + shared_theme
+})
+p_elbow <- p_elbow + theme(axis.title.x = element_text(size = shared_base), axis.title.y = element_text(size = shared_base))
+
+# ---------- 2) Scree (variance + cumulative) ----------
+
+sdev <- as.numeric(obj@reductions$pca@stdev)
+if (is.null(sdev) || length(sdev) == 0) stop("Cannot extract PCA sdev; ensure RunPCA() succeeded.")
+var_explained <- (sdev^2) / sum(sdev^2) * 100
+cumvar <- cumsum(var_explained)
+npcs <- length(var_explained)
+df_scree <- tibble(PC = seq_len(npcs), Var = var_explained, CumVar = cumvar)
+
+p_scree <- ggplot(df_scree, aes(x = PC)) +
+geom_col(aes(y = Var), width = 0.7, fill = "grey85", color = "grey72") +
+geom_point(aes(y = Var), size = 1.8, color = "#2b8cbe") +
+geom_line(aes(y = CumVar), color = "#2ca02c", size = 1.1) +
+scale_x_continuous(breaks = seq(0, min(npcs, 50), by = 5), minor_breaks = seq(1, min(npcs, 50), by = 1),
+expand = expansion(add = c(1, 1))) +
+scale_y_continuous(
+name = "Variance explained (%)",
+limits = c(0, max(c(df_scree$Var, df_scree$CumVar)) * 1.06),
+expand = c(0, 0),
+sec.axis = sec_axis(~ ., name = "Cumulative variance (%)")
+) +
+coord_cartesian(clip = "off") +
+labs(title = "Scree: % variance per PC + cumulative", x = "Principal component") +
+shared_theme +
+theme(
+axis.text.x = element_text(size = shared_base - 2),
+axis.text.y = element_text(size = shared_base - 2),
+axis.text.y.right = element_text(size = shared_base - 2, colour = "grey50"),
+axis.title.y.right = element_text(size = shared_base - 1, angle = 90, vjust = 1, colour = "grey50"),
+plot.margin = margin(t = 6, r = 12, b = 6, l = 6)
+)
+
+# annotate cumulative end value (nudged right & up for clarity)
+
+last_pt <- df_scree %>% slice_tail(n = 1)
+p_scree <- p_scree +
+annotate("text",
+x = last_pt$PC + 0.8,
+y = last_pt$CumVar + max(df_scree$Var) * 0.03,
+label = paste0(round(last_pt$CumVar, 0)),
+color = "#2ca02c", size = 3.8, fontface = "bold", hjust = 1)
+
+# ---------- 3) Loadings and barplots ----------
+
+# robustly extract loadings
+
+loadings_mat <- tryCatch(Seurat::Loadings(obj, "pca"), error = function(e) NULL)
+if (is.null(loadings_mat)) {
+if (!is.null(obj@reductions$[pca@feature.loadings](mailto:pca@feature.loadings))) loadings_mat <- obj@reductions$[pca@feature.loadings](mailto:pca@feature.loadings)
+else if (!is.null(obj@reductions$pca@loadings)) loadings_mat <- obj@reductions$pca@loadings
+}
+stopifnot(!is.null(loadings_mat) && nrow(loadings_mat) > 0 && !is.null(rownames(loadings_mat)))
+
+plot_top_loadings <- function(pc, n = 15, mat = loadings_mat, pal_pos = "#2b83ba", pal_neg = "#de2d26") {
+df <- data.frame(gene = rownames(mat), loading = as.numeric(mat[, pc]), stringsAsFactors = FALSE)
+df <- df %>% mutate(abs_loading = abs(loading)) %>% arrange(desc(abs_loading)) %>% slice_head(n = n)
+df$sign <- ifelse(df$loading >= 0, "pos", "neg")
+df$gene <- factor(df$gene, levels = rev(df$gene))
+p <- ggplot(df, aes(x = gene, y = loading, fill = sign)) +
+geom_col() +
+coord_flip() +
+scale_fill_manual(values = c("pos" = pal_pos, "neg" = pal_neg)) +
+labs(title = paste0("PC", pc, " — top ", n, " absolute loadings"), x = NULL, y = "Loading") +
+theme_minimal(base_size = shared_base - 1) +
+theme(legend.position = "none", plot.title = element_text(face = "bold"), axis.text.y = element_text(size = shared_base - 2))
+list(plot = p, tbl = df)
+}
+
+out1 <- plot_top_loadings(1, n = 15)
+out2 <- plot_top_loadings(2, n = 15)
+p_pc1 <- out1$plot; tbl_pc1 <- out1$tbl
+p_pc2 <- out2$plot; tbl_pc2 <- out2$tbl
+
+# symmetric axis for PC2 (so positives are visually comparable)
+
+max_abs_pc2 <- max(abs(loadings_mat[, 2]), na.rm = TRUE)
+if (is.finite(max_abs_pc2) && max_abs_pc2 > 0) {
+p_pc2 <- p_pc2 + scale_y_continuous(limits = c(-max_abs_pc2 * 1.05, max_abs_pc2 * 1.05))
+}
+
+# small layout/label tweaks and remove legends so bottom row isn't narrowed
+
+p_pc1 <- p_pc1 + shared_theme + theme(legend.position = "none", axis.text.y = element_text(size = shared_base - 2),
+plot.margin = margin(t = 6, r = 10, b = 6, l = 18))
+p_pc2 <- p_pc2 + shared_theme + theme(legend.position = "none", axis.text.y = element_text(size = shared_base - 2),
+plot.margin = margin(t = 6, r = 10, b = 6, l = 8))
+
+# export loading tables
+
+readr::write_csv(tbl_pc1 %>% mutate(pc = 1), file.path(plots_dir, "PC1_top_loadings.csv"))
+readr::write_csv(tbl_pc2 %>% mutate(pc = 2), file.path(plots_dir, "PC2_top_loadings.csv"))
+
+# ---------- 4) Compose & save (final polished layout) ----------
+
+# re-balance widths/heights for visual harmony
+
+top_row <- (p_elbow + p_scree) + plot_layout(widths = c(1.35, 1))
+bottom_row <- (p_pc1 + p_pc2) + plot_layout(widths = c(1, 1))
+combined <- top_row / bottom_row + plot_layout(heights = c(2.35, 1.05))
+
+# save at publication-friendly size
+
+save_base <- file.path(plots_dir, "PCA_diagnostics_scree_style_final_v4")
+save_both(combined, save_base, width = 16, height = 10.5, dpi = 600)
+message("Saved combined PCA diagnostics to: ", paste0(save_base, ".{png,svg}"))
+
+# ---------- 5) Extra diagnostics (kept modest) ----------
+
+p_load <- tryCatch({
+VizDimLoadings(obj, dims = 1:30, reduction = "pca") + ggtitle("Top loadings (PC1–PC30)") + shared_theme
+}, error = function(e) { message("VizDimLoadings failed: ", e$message); NULL })
+if (!is.null(p_load)) save_both(p_load, file.path(plots_dir, "PCA_Loadings_PC1_30"), width = 12, height = 8)
+
+p_dimheat <- tryCatch({
+DimHeatmap(obj, dims = 1:12, cells = 500, balanced = TRUE, fast = TRUE) + ggtitle("DimHeatmap PCs 1–12 (top cells)") + shared_theme
+}, error = function(e) { message("DimHeatmap failed: ", e$message); NULL })
+if (!is.null(p_dimheat)) save_both(p_dimheat, file.path(plots_dir, "PCA_DimHeatmap_1_12"), width = 12, height = 10)
+
+# ---------- 6) UMAP (unchanged) ----------
+
+dims_pca <- 1:30
+message("Running UMAP (dims = 1:30)...")
+obj <- RunUMAP(obj, reduction = "pca", dims = dims_pca, n.neighbors = 30, min.dist = 0.3, seed.use = 156,
+umap.method = "uwot", metric = "cosine", return.model = FALSE)
+
+p_umap_pca_sample <- tryCatch({
+DimPlot(obj, reduction = "umap", group.by = "sample", raster = TRUE, raster.dpi = c(600,600), pt.size = 0.5) +
+ggtitle("Pre-Harmony UMAP by sample") + shared_theme
+}, error = function(e) { message("UMAP by sample failed: ", e$message); NULL })
+
+p_umap_pca_donor <- tryCatch({
+DimPlot(obj, reduction = "umap", group.by = "donor", raster = TRUE, raster.dpi = c(600,600), pt.size = 0.5) +
+ggtitle("Pre-Harmony UMAP by donor") + shared_theme
+}, error = function(e) { message("UMAP by donor failed: ", e$message); NULL })
+
+p_umap_pca_cond <- tryCatch({
+DimPlot(obj, reduction = "umap", group.by = "condition", raster = TRUE, raster.dpi = c(600,600), pt.size = 0.5) +
+ggtitle("Pre-Harmony UMAP by condition") + shared_theme
+}, error = function(e) { message("UMAP by condition failed: ", e$message); NULL })
+
+if (!is.null(p_umap_pca_sample)) save_both(p_umap_pca_sample, file.path(plots_dir, "UMAP_preHarmony_by_sample"), width = 12, height = 8)
+if (!is.null(p_umap_pca_donor))  save_both(p_umap_pca_donor,  file.path(plots_dir, "UMAP_preHarmony_by_donor"),  width = 12, height = 8)
+if (!is.null(p_umap_pca_cond))   save_both(p_umap_pca_cond,   file.path(plots_dir, "UMAP_preHarmony_by_condition"), width = 12, height = 8)
+
+message("PCA / final diagnostics / loadings / UMAP block completed. Files saved to: ", plots_dir)
+
+```
+```
+
+
+## 11) Harmony (fixed)
+
+```{r}
+stop_quiet("pca" %in% names(obj@reductions), "PCA reduction missing — run RunPCA first.")
+stop_quiet("donor" %in% colnames(obj@meta.data), "Metadata lacks 'donor' column.")
+
+# Fix & save pre-Harmony UMAPs (re-saved at 600 dpi)
+p_umap_pca_sample <- DimPlot(obj, reduction = "umap", group.by = "sample",
+                             raster = TRUE, raster.dpi = c(600,600), pt.size = 0.5)
+p_umap_pca_donor  <- DimPlot(obj, reduction = "umap", group.by = "donor",\                             raster = TRUE, raster.dpi = c(600,600), pt.size = 0.5)
+p_umap_pca_cond   <- DimPlot(obj, reduction = "umap", group.by = "condition",\                             raster = TRUE, raster.dpi = c(600,600), pt.size = 0.5)
+save_both(p_umap_pca_sample, file.path(plots_dir, "UMAP_preHarmony_by_sample"))
+save_both(p_umap_pca_donor,  file.path(plots_dir, "UMAP_preHarmony_by_donor"))
+save_both(p_umap_pca_cond,   file.path(plots_dir, "UMAP_preHarmony_by_condition"))
+
+# Run Harmony on PCA
+npcs     <- ncol(Embeddings(obj, "pca"))
+stop_quiet(npcs > 0, "PCA has zero components.")
+dims_use <- 1:min(40, npcs)
+obj <- harmony::RunHarmony(
+  object         = obj,
+  group.by.vars  = "donor",
+  reduction.use  = "pca",
+  dims.use       = dims_use,
+  assay.use      = DefaultAssay(obj),
+  reduction.save = "harmony",
+  project.dim    = TRUE,
+  verbose        = TRUE
+)
+stop_quiet("harmony" %in% names(obj@reductions), "Harmony reduction missing after RunHarmony.")
+saveRDS(obj, file.path(rds_dir, "03_after_harmony.rds"))
+
+# UMAP on Harmony
+umap_dims <- 1:min(30, ncol(Embeddings(obj, "harmony")))
+obj <- RunUMAP(
+  obj, reduction = "harmony", dims = umap_dims,
+  n.neighbors = 30, min.dist = 0.3, seed.use = 156,
+  umap.method = "uwot", metric = "cosine", return.model = FALSE,
+  reduction.name = "umap_harmony"
+)
+
+# Harmony UMAPs + save
+p_umap_harmony_sample <- DimPlot(
+  obj, reduction = "umap_harmony", group.by = "sample",
+  raster = TRUE, raster.dpi = c(600,600), pt.size = 0.5
+)
+p_umap_harmony_donor <- DimPlot(
+  obj, reduction = "umap_harmony", group.by = "donor",
+  raster = TRUE, raster.dpi = c(600,600), pt.size = 0.5
+)
+p_umap_harmony_cond <- DimPlot(
+  obj, reduction = "umap_harmony", group.by = "condition",
+  raster = TRUE, raster.dpi = c(600,600), pt.size = 0.5
+)
+save_both(p_umap_harmony_sample, file.path(plots_dir, "UMAP_harmony_by_sample"))
+save_both(p_umap_harmony_donor,  file.path(plots_dir, "UMAP_harmony_by_donor"))
+save_both(p_umap_harmony_cond,   file.path(plots_dir, "UMAP_harmony_by_condition"))
+
+# Optional LISI
+if (requireNamespace("lisi", quietly = TRUE)) {
+  emb  <- as.data.frame(Embeddings(obj, "harmony"))
+  meta <- obj@meta.data[, c("donor","condition"), drop = FALSE]
+  lisi_res <- lisi::compute_lisi(emb, meta, label_colnames = c("donor","condition"))
+  readr::write_csv(as.data.frame(lisi_res), file.path(meta_dir, "lisi_scores_harmony.csv"))
+}
+```
+
+## 12) Neighbors
+
+```{r}
+dims_use <- 1:30
+obj <- FindNeighbors(obj, reduction = "harmony", dims = dims_use, k.param = 30)
+```
+
+## 13) Clustering r = 0.1
+
+```{r}
+# Ensure clustering algorithm is set (3 = Leiden; 1 = Louvain, 2 = SLM)
+if (!exists("algo")) algo <- 3
+
+r <- 0.1
+obj <- FindClusters(obj, resolution = r, algorithm = algo)
+
+cl_col <- sprintf("seurat_clusters_res.%s", r)
+obj[[cl_col]] <- factor(Idents(obj))
+Idents(obj)   <- cl_col
+
+saveRDS(obj, file.path(rds_dir, sprintf("04_postIntegration_res%s.rds", r)))
+
+dirs <- make_res_dirs(project_dir, as.character(r))
+```
+
+## 14) Plots r = 0.1
+
+```{r}
+set.seed(156)
+
+# Ensure Harmony dims and neighbors
+dims_use <- 1:min(30, ncol(Embeddings(obj, "harmony")))
+if (!"harmony_nn" %in% names(obj@graphs)) {
+  obj <- FindNeighbors(obj, reduction = "harmony", dims = dims_use, k.param = 30)
+}
+
+# Cluster at r = 0.1 and store identities in a dedicated column
+r    <- 0.1
+algo <- if (!exists("algo")) 3 else algo
+obj  <- FindClusters(obj, resolution = r, algorithm = algo)
+cl_col <- sprintf("seurat_clusters_res.%s", r)
+obj[[cl_col]] <- factor(Idents(obj))
+Idents(obj)   <- cl_col
+
+saveRDS(obj, file.path(rds_dir, sprintf("04_postIntegration_res%s.rds", r)))
+dirs <- make_res_dirs(project_dir, as.character(r))
+
+# UMAP on Harmony (standard name "umap" for downstream plotting)
+DefaultAssay(obj) <- "SCT"
+obj <- RunUMAP(
+  obj, reduction = "harmony", dims = dims_use,
+  n.neighbors = 30, min.dist = 0.3, seed.use = 156,
+  umap.method = "uwot", metric = "cosine", return.model = FALSE,
+  reduction.name = "umap"
+)
+
+# UMAPs
+p_umap_clusters <- DimPlot(
+  obj, reduction = "umap", group.by = cl_col,
+  label = TRUE, repel = TRUE, raster = TRUE, raster.dpi = c(600,600),
+  pt.size = 0.5, label.size = 3
+) + ggplot2::ggtitle("UMAP (res=0.1)")
+
+p_umap_sample <- DimPlot(
+  obj, reduction = "umap", group.by = "sample",
+  raster = TRUE, raster.dpi = c(600,600), pt.size = 0.5
+) + ggplot2::ggtitle("UMAP by sample (res=0.1)")
+
+p_umap_split <- DimPlot(
+  obj, reduction = "umap", split.by = "sample",
+  label = TRUE, repel = TRUE, raster = TRUE, raster.dpi = c(600,600), pt.size = 0.3
+) + ggplot2::ggtitle("UMAP split by sample (res=0.1)")
+
+save_both(p_umap_clusters, file.path(dirs$plots, "UMAP_clusters_res0.1"))
+save_both(p_umap_sample,   file.path(dirs$plots, "UMAP_by_sample_res0.1"))
+save_both(p_umap_split,    file.path(dirs$plots, "UMAP_split_by_sample_res0.1"))
+
+# Markers
+markers <- FindAllMarkers(
+  obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25,
+  test.use = "wilcox", max.cells.per.ident = 1000, random.seed = 156
+)
+readr::write_csv(markers, file.path(dirs$markers, "cluster_markers_res0.1.csv"))
+
+# Heatmap of top markers
+top_markers <- markers %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) %>%
+  dplyr::pull(gene) %>% unique()
+
+hm_feats <- intersect(top_markers, rownames(obj))
+if (length(hm_feats) >= 2) {
+  suppressWarnings({
+    obj <- ScaleData(obj, assay = DefaultAssay(obj), features = hm_feats, verbose = FALSE, clip.max = 3)
+  })
+  p_heat <- DoHeatmap(
+    obj, features = hm_feats, assay = DefaultAssay(obj),
+    slot = "scale.data", raster = TRUE
+  ) + ggplot2::ggtitle("Top markers heatmap (res=0.1)")
+} else {
+  p_heat <- ggplot2::ggplot() + ggplot2::ggtitle("Heatmap unavailable at res=0.1 (insufficient features)")
+}
+save_both(p_heat, file.path(dirs$plots, "Heatmap_top10_markers_res0.1"))
+
+# Dot plot for selected immune markers (if present)
+if (exists("immune_panel") && length(intersect(immune_panel, rownames(obj))) > 0) {
+  p_dot <- DotPlot(
+    obj, features = intersect(immune_panel, rownames(obj)),
+    scale.by = "size", dot.min = 0.1
+  ) +
+    ggplot2::ggtitle("Selected immune markers (res=0.1)") +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1))
+  save_both(p_dot, file.path(dirs$plots, "DotPlot_selected_markers_res0.1"))
+}
+
+# Composition by donor/condition
+meta_res <- obj@meta.data %>%
+  dplyr::mutate(cluster = as.character(.data[[cl_col]]))
+prop_tbl <- meta_res %>%
+  dplyr::count(donor, condition, cluster, name = "cells") %>%
+  dplyr::group_by(donor, condition) %>%
+  dplyr::mutate(prop = cells / sum(cells)) %>%
+  dplyr::ungroup()
+readr::write_csv(prop_tbl, file.path(dirs$meta, "proportions_by_donor_condition_res0.1.csv"))
+utils::write.csv(meta_res, file.path(dirs$meta, "metadata_res0.1.csv"), row.names = TRUE)
+
+p_prop <- ggplot2::ggplot(prop_tbl, ggplot2::aes(x = cluster, y = prop, fill = condition)) +
+  ggplot2::geom_col(position = "fill") +
+  ggplot2::facet_wrap(~ donor, ncol = 2) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format()) +
+  ggplot2::labs(title = "Cluster composition by donor/condition (res=0.1)", x = "Cluster", y = "Proportion") +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1))
+save_both(p_prop, file.path(dirs$plots, "composition_by_donor_condition_res0.1"))
+
+# Volcano plots per cluster and top-marker bars
+set.seed(156)
+clusters <- levels(Idents(obj))
+for (cl in clusters) {
+  de <- FindMarkers(
+    obj, ident.1 = cl, ident.2 = NULL,
+    logfc.threshold = 0, min.pct = 0, test.use = "wilcox",
+    random.seed = 156
+  )
+  de$gene <- rownames(de)
+  de$nlp  <- -log10(pmax(de$p_val_adj, .Machine$double.eps))
+  de$sig  <- (de$p_val_adj < 0.05) & (abs(de$avg_log2FC) > 0.25)
+  top_lab <- de %>% dplyr::arrange(p_val_adj) %>% dplyr::slice_head(n = 10)
+
+  p_volc <- ggplot2::ggplot(de, ggplot2::aes(x = avg_log2FC, y = nlp)) +
+    ggplot2::geom_point(alpha = 0.6, size = 0.7) +
+    ggplot2::geom_point(data = subset(de, sig), size = 0.7) +
+    ggplot2::geom_text(
+      data = top_lab, ggplot2::aes(label = gene),
+      size = 2, vjust = -0.2, check_overlap = TRUE
+    ) +
+    ggplot2::geom_vline(xintercept = c(-0.25, 0.25), linetype = 2) +
+    ggplot2::geom_hline(yintercept = -log10(0.05), linetype = 2) +
+    ggplot2::labs(
+      title = paste0("Volcano: cluster ", cl, " vs. rest (res=0.1)"),
+      x = "avg_log2FC", y = "-log10(adj p)"
+    ) +
+    ggplot2::theme_minimal(base_size = 12)
+
+  save_both(p_volc, file.path(dirs$plots, paste0("volcano_cluster_", cl, "_res0.1")))
+
+  pos <- markers %>% dplyr::filter(cluster == cl) %>%
+    dplyr::slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE)
+  if (nrow(pos) > 0) {
+    p_bar <- ggplot2::ggplot(pos, ggplot2::aes(x = reorder(gene, avg_log2FC), y = avg_log2FC)) +
+      ggplot2::geom_col() + ggplot2::coord_flip() +
+      ggplot2::labs(title = paste0("Top markers: cluster ", cl, " (res=0.1)"), x = "Gene", y = "avg_log2FC")
+    save_both(p_bar, file.path(dirs$plots, paste0("TopMarkers_bar_cluster_", cl, "_res0.1")))
+  }
+}
+```
+
+
+
+```{r}
+## 27) SingleR — per-cell automated annotation (clean & lean)
+
+# packages
+pkgs <- c("SingleR","celldex","SingleCellExperiment","SummarizedExperiment",
+          "scater","Seurat","dplyr","readr","svglite","ggplot2")
+for (p in pkgs) if (!requireNamespace(p, quietly=TRUE)) {
+  if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+  BiocManager::install(p, ask=FALSE, update=FALSE)
+}
+suppressPackageStartupMessages({
+  library(SingleR); library(celldex); library(SingleCellExperiment)
+  library(SummarizedExperiment); library(scater); library(Seurat)
+  library(dplyr); library(readr); library(svglite); library(ggplot2)
+})
+
+# paths / names
+cluster_col <- "seurat_clusters_res.0.1"
+label_col   <- "celltype_res0.1_auto"
+plots_dir   <- if (exists("plots_dir")) plots_dir else file.path(getwd(),"plots")
+meta_dir    <- if (exists("meta_dir")) meta_dir else file.path(getwd(),"meta")
+dir.create(plots_dir, recursive=TRUE, showWarnings=FALSE)
+dir.create(meta_dir,  recursive=TRUE, showWarnings=FALSE)
+
+# SCT as default, convert to SCE, ensure logcounts
+DefaultAssay(obj) <- "SCT"
+sce <- as.SingleCellExperiment(obj, assay = "SCT")
+if (!"logcounts" %in% names(SummarizedExperiment::assays(sce))) {
+  a <- names(SummarizedExperiment::assays(sce))
+  if ("data" %in% a) SummarizedExperiment::assay(sce,"logcounts") <- SummarizedExperiment::assay(sce,"data")
+  else if ("counts" %in% a) {
+    if (!requireNamespace("edgeR", quietly=TRUE)) BiocManager::install("edgeR", ask=FALSE)
+    SummarizedExperiment::assay(sce,"logcounts") <- edgeR::cpm(SummarizedExperiment::assay(sce,"counts"), log=TRUE, prior.count=1)
+  } else stop("No 'data' or 'counts' assay to create 'logcounts'.")
+}
+
+# references
+ref1 <- tryCatch(celldex::MonacoImmuneData(), error = function(e) NULL)
+ref2 <- tryCatch(celldex::BlueprintEncodeData(), error = function(e) NULL)
+if (is.null(ref1) && is.null(ref2)) stop("No celldex references available.")
+
+# SingleR per-cell (Monaco preferred, Blueprint as fallback)
+pred1 <- NULL; pred2 <- NULL
+if (!is.null(ref1)) {
+  pred1 <- tryCatch(
+    SingleR(test = sce, ref = ref1, labels = ref1$label.fine,
+            assay.type.test = "logcounts", assay.type.ref = "logcounts",
+            fine.tune = TRUE, de.method = "wilcox", reduce = TRUE, verbose = FALSE),
+    error = function(e) NULL
+  )
+}
+if (!is.null(ref2)) {
+  pred2 <- tryCatch(
+    SingleR(test = sce, ref = ref2, labels = ref2$label.main,
+            assay.type.test = "logcounts", assay.type.ref = "logcounts",
+            fine.tune = TRUE, de.method = "wilcox", reduce = TRUE, verbose = FALSE),
+    error = function(e) NULL
+  )
+}
+
+# extract labels and combine (Monaco preferred)
+labels1 <- if (!is.null(pred1) && !is.null(pred1$labels)) { labs <- pred1$labels; names(labs) <- colnames(sce); labs } else NULL
+labels2 <- if (!is.null(pred2) && !is.null(pred2$labels)) { labs <- pred2$labels; names(labs) <- colnames(sce); labs } else NULL
+if (!is.null(labels1) && !is.null(labels2)) combined <- ifelse(!is.na(labels1), labels1, labels2)
+else if (!is.null(labels1)) combined <- labels1
+else if (!is.null(labels2)) combined <- labels2
+else stop("SingleR produced no labels.")
+
+# align and write to Seurat metadata
+combined <- combined[colnames(sce)]
+obj[[label_col]] <- factor(combined[colnames(obj)])
+
+# save summaries and SingleR objects
+lbl_counts <- as.data.frame(table(obj@meta.data[[label_col]]))
+write_csv(lbl_counts, file.path(meta_dir, paste0("label_counts_", label_col, ".csv")))
+if (!is.null(pred1)) saveRDS(pred1, file.path(meta_dir, "SingleR_pred_monaco.rds"))
+if (!is.null(pred2)) saveRDS(pred2, file.path(meta_dir, "SingleR_pred_blueprint.rds"))
+write_csv(obj@meta.data %>% tibble::rownames_to_column("cell_id"), file.path(meta_dir, paste0("seurat_meta_with_", label_col, ".csv")))
+
+# cluster x label contingency (if cluster exists)
+if (cluster_col %in% colnames(obj@meta.data)) {
+  ctab <- as.data.frame.matrix(table(Cluster = obj@meta.data[[cluster_col]], Label = obj@meta.data[[label_col]]))
+  write_csv(tibble::rownames_to_column(ctab, "cluster"), file.path(meta_dir, paste0("contingency_", cluster_col, "_vs_", label_col, ".csv")))
+}
+
+# UMAP plot if present
+umap_name <- if ("umap_harmony" %in% names(obj@reductions)) "umap_harmony" else if ("umap" %in% names(obj@reductions)) "umap" else NULL
+if (!is.null(umap_name)) {
+  p_umap <- DimPlot(obj, reduction = umap_name, group.by = label_col, label = TRUE, repel = TRUE, pt.size = 0.5) + ggtitle(label_col)
+  ggsave(file.path(plots_dir, paste0("UMAP_", label_col, ".png")), p_umap, width = 12, height = 8, dpi = 300)
+  svglite::svglite(file.path(plots_dir, paste0("UMAP_", label_col, ".svg")), width = 12, height = 8); print(p_umap); dev.off()
+}
+
+# canonical marker dotplot (if markers present)
+markers <- c("CD3D","CD4","CD8A","MS4A1","CD14","LYZ","NKG7","GNLY","FCGR3A","PPBP")
+markers_exist <- markers[markers %in% rownames(obj)]
+if (length(markers_exist)>0) {
+  Idents(obj) <- label_col
+  avg <- AverageExpression(obj, assays="SCT", features=markers_exist, slot="data")$SCT
+  write_csv(as.data.frame(avg) %>% tibble::rownames_to_column("gene"), file.path(meta_dir, paste0("avg_expr_by_", label_col, ".csv")))
+  p_dot <- DotPlot(obj, features = markers_exist, group.by = label_col) + ggtitle(paste0("Markers_by_", label_col))
+  ggsave(file.path(plots_dir, paste0("Dotplot_markers_", label_col, ".png")), p_dot, width = 12, height = 6, dpi = 300)
+  svglite::svglite(file.path(plots_dir, paste0("Dotplot_markers_", label_col, ".svg")), width = 12, height = 6); print(p_dot); dev.off()
+}
+```
+
+

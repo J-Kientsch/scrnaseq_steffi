@@ -1,6 +1,457 @@
 ---
-title: "Seurat v5 scRNA-seq — Import → QC → Doublets → SCT v2 → PCA → Harmony → UMAP → Multi-Res Clustering"
-author: "Jacky"
+title: "scRNASeq for Steffi - PBMCs (v5-checked)"
+format:
+  html:
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: true
+  message: true
+---
+
+## Setup
+
+```{r}
+# clear environment 
+rm(list = ls())
+
+# reproducibility 
+set.seed(156)
+
+# import the libraries 
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+library(pacman)
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+pacman::p_load(
+  Seurat,
+  SeuratObject,
+  tidyverse,
+  patchwork,
+  future,
+  harmony,
+  SingleCellExperiment,
+  svglite,
+  sctransform,
+  glmGamPoi
+)
+
+if (requireNamespace("BPCells", quietly = TRUE)) {
+  library(BPCells)
+}
+
+# Bioc deps if missing
+if (!requireNamespace("scater", quietly = TRUE)) BiocManager::install("scater", ask = FALSE, update = FALSE, quiet = TRUE)
+if (!requireNamespace("scDblFinder", quietly = TRUE)) BiocManager::install("scDblFinder", ask = FALSE, update = FALSE, quiet = TRUE)
+library(scater)
+library(scDblFinder)
+
+future::plan("sequential")
+options(future.globals.maxSize = 110 * 1024^3)
+theme_set(ggplot2::theme_minimal(base_size = 14))
+```
+
+## Helper functions 
+
+```{r}
+# quiet stop helper used below
+stop_quiet <- function(cond, msg) {
+  if (!isTRUE(cond)) stop(msg, call. = FALSE)
+}
+
+qc_summary <- function(obj, group.by = "sample") {
+  md <- obj@meta.data
+  stopifnot(group.by %in% colnames(md))
+  md |>
+    dplyr::group_by(.data[[group.by]]) |>
+    dplyr::summarise(
+      cells = dplyr::n(),
+      nFeature_median = median(nFeature_RNA, na.rm = TRUE),
+      nCount_median   = median(nCount_RNA,   na.rm = TRUE),
+      mito_median     = median(percent.mt,   na.rm = TRUE),
+      ribo_median     = median(percent.ribo, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+qc_alt_text <- function(obj, group.by = "sample") {
+  s <- qc_summary(obj, group.by)
+  paste0(
+    "QC summary by ", group.by, ":\n",
+    paste0(
+      sprintf("- %s: %d cells; median nFeature=%g; nCount=%g; mito=%g%%; ribo=%g%%",
+              s[[group.by]], s$cells, s$nFeature_median, s$nCount_median, s$mito_median, s$ribo_median),
+      collapse = "\n"
+    ),
+    "\n"
+  )
+}
+
+doublet_summary <- function(dbl_calls_df) {
+  dbl_calls_df |>
+    dplyr::group_by(sample) |>
+    dplyr::summarise(
+      cells = dplyr::n(),
+      n_doublet = sum(scDblFinder.class == "doublet", na.rm = TRUE),
+      pct_doublet = 100 * n_doublet / cells,
+      .groups = "drop"
+    )
+}
+
+mrk_find <- function(obj, assay = "SCT", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, group.by = NULL) {
+  DefaultAssay(obj) <- assay
+  if (!is.null(group.by)) Idents(obj) <- obj@meta.data[[group.by]]
+  FindAllMarkers(obj, only.pos = only.pos, min.pct = min.pct, logfc.threshold = logfc.threshold)
+}
+
+heatmap_accessible <- function(obj, features, group.by, layer = "data", title = NULL) {
+  Idents(obj) <- obj@meta.data[[group.by]]
+  # Seurat v5 still accepts 'slot' here; pass 'data'/'scale.data'/etc
+  p <- DoHeatmap(obj, features = features, slot = layer, raster = FALSE)
+  if (!is.null(title)) p <- p + ggplot2::ggtitle(title)
+  p
+}
+
+dotplot_alt_text <- function(obj, features, group.by) {
+  Idents(obj) <- obj@meta.data[[group.by]]
+  dp <- Seurat::DotPlot(obj, features = features)$data
+  dp <- dp |>
+    dplyr::mutate(pct = round(pct.exp, 1), expr = round(avg.exp.scaled, 2)) |>
+    dplyr::arrange(features.plot, id)
+  lines <- paste0(
+    dp$features.plot, " in ", dp$id, ": ", dp$pct, "% cells; avg scaled expr ", dp$expr
+  )
+  paste(c("DotPlot textual summary:", lines), collapse = "\n")
+}
+
+cluster_alt_text <- function(obj, group.by, markers = NULL, top_n = 5) {
+  Idents(obj) <- obj@meta.data[[group.by]]
+  if (is.null(markers)) {
+    markers <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  }
+  if (is.null(markers) || nrow(markers) == 0) {
+    return(paste0("No differentially expressed markers identified for grouping '", group.by, "'.\n"))
+  }
+  top <- markers |>
+    dplyr::group_by(cluster) |>
+    dplyr::slice_max(order_by = avg_log2FC, n = top_n, with_ties = FALSE) |>
+    dplyr::summarise(genes = paste(gene, collapse = ", "), .groups = "drop")
+  paste0(
+    "Cluster summaries (", group.by, "):\n",
+    paste0(sprintf("- cluster %s: top markers %s", top$cluster, top$genes), collapse = "\n"),
+    "\n"
+  )
+}
+
+# Safer Idents<- setter
+set_idents_safe <- function(object, vec) {
+  v <- vec
+  if (is.list(v)) v <- unlist(v, use.names = FALSE)
+  if (is.null(v)) stop("Cluster vector is NULL.", call. = FALSE)
+  if (!is.factor(v)) v <- factor(v)
+  if (length(v) != ncol(object)) {
+    stop(sprintf("Cluster vector length (%s) != number of cells (%s).", length(v), ncol(object)), call. = FALSE)
+  }
+  Idents(object) <- v
+  object
+}
+
+# Simple saver for PNG+SVG
+save_both <- function(plot_obj, filebase, width = 10, height = 7, dpi = 600) {
+  ggplot2::ggsave(paste0(filebase, ".png"), plot_obj, width = width, height = height, units = "in", dpi = dpi, limitsize = FALSE)
+  ggplot2::ggsave(paste0(filebase, ".svg"), plot_obj, width = width, height = height, units = "in", device = svglite::svglite)
+}
+
+# Directory helper
+make_res_dirs <- function(root, res_label) {
+  res_dir   <- file.path(root, paste0("res_", res_label))
+  d_plots   <- file.path(res_dir, "plots")
+  d_markers <- file.path(res_dir, "markers")
+  d_qc      <- file.path(res_dir, "qc")
+  d_meta    <- file.path(res_dir, "metadata")
+  d_access  <- file.path(res_dir, "accessibility")
+  dir.create(d_plots,   recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_markers, recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_qc,      recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_meta,    recursive = TRUE, showWarnings = FALSE)
+  dir.create(d_access,  recursive = TRUE, showWarnings = FALSE)
+  list(res_dir = res_dir, plots = d_plots, markers = d_markers, qc = d_qc, meta = d_meta, access = d_access)
+}
+```
+
+## Set paths 
+
+```{r}
+base_dir <- "/home/jacky/scRNASeq_Steffi"
+input_dir <- file.path(base_dir, "data") 
+project <- "scrnaseq_steffi_pbmcs"
+
+out_root   <- file.path(base_dir, "analysis")
+out_dir    <- file.path(out_root, project)
+plots_dir  <- file.path(out_dir, "plots")
+meta_dir   <- file.path(out_dir, "metadata")
+rds_dir    <- file.path(out_dir, "rds")
+access_dir <- file.path(out_dir, "accessibility")
+
+dir.create(out_dir,    recursive = TRUE, showWarnings = FALSE)
+dir.create(plots_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(meta_dir,   recursive = TRUE, showWarnings = FALSE)
+dir.create(rds_dir,    recursive = TRUE, showWarnings = FALSE)
+dir.create(access_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Load 10X data and merge 
+
+```{r}
+parse_info <- function(fp) {
+  bn    <- basename(fp)
+  core  <- tools::file_path_sans_ext(bn)
+  parts <- strsplit(core, "_", fixed = TRUE)[[1]]
+  donor <- dplyr::na_if(parts[1], "")
+  condition <- if (length(parts) >= 2) parts[2] else NA_character_
+  tibble::tibble(file = fp, sample = core, donor = donor, condition = condition)
+}
+
+h5_files <- list.files(input_dir, pattern = "*.(h5|hdf5)$", full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
+stop_quiet(length(h5_files) > 0, paste0("No .h5/.hdf5 files found under ", input_dir))
+
+info <- purrr::map_dfr(h5_files, parse_info)
+stop_quiet(all(!is.na(info$donor)) & all(!is.na(info$condition)),
+           "Expected file naming: DONOR_CONDITION_*.h5 (e.g., NB166_il18_xxx.h5)")
+readr::write_csv(info, file.path(meta_dir, "samples_parsed.csv"))
+print(info)
+
+# Safer reader for h5 with multiple assays (choose Gene Expression if present)
+read_h5_to_matrix <- function(fp) {
+  m <- Read10X_h5(fp)
+  if (is.list(m)) {
+    if ("Gene Expression" %in% names(m)) return(m[["Gene Expression"]])
+    return(m[[1]])
+  }
+  m
+}
+
+objs <- vector("list", nrow(info))
+for (i in seq_len(nrow(info))) {
+  mat <- read_h5_to_matrix(info$file[i])
+  so  <- CreateSeuratObject(counts = mat, project = info$donor[i], min.cells = 3, min.features = 200)
+  so$sample    <- info$sample[i]
+  so$donor     <- info$donor[i]
+  so$condition <- info$condition[i]
+  colnames(so) <- paste(info$sample[i], colnames(so), sep = "_")
+  objs[[i]]    <- so
+}
+stop_quiet(length(objs) > 0, "No Seurat objects created.")
+
+obj <- Reduce(function(a, b) merge(a, b), objs)
+stop_quiet(inherits(obj, "Seurat"), "Merged object is not Seurat.")
+utils::write.csv(obj@meta.data, file.path(meta_dir, "metadata_raw.csv"))
+dim(obj)
+```
+
+## Basic QC 
+
+```{r}
+Assays(obj) # show present assays
+
+DefaultAssay(obj) <- "RNA"
+obj[["percent.mt"]]   <- PercentageFeatureSet(obj, pattern = "^MT-")
+obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+```
+
+## Violin plots (raw)
+
+```{r}
+# FIX: VlnPlot in Seurat v5 does not take a 'layer' argument.
+# These features are metadata, so no slot/layer is required.
+p_vln_raw <- VlnPlot(
+  obj,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"),
+  group.by = "sample",
+  pt.size  = 0,
+  ncol     = 2
+)
+
+save_both(p_vln_raw, file.path(plots_dir, "qc_violin_raw"), width = 16, height = 9, dpi = 600)
+```
+
+## Scatter plots (raw)
+
+```{r}
+p_scatter_raw <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+                 FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.mt")
+
+save_both(p_scatter_raw, file.path(plots_dir, "qc_scatter_raw"), width = 16, height = 9, dpi = 600)
+```
+
+## Accessible QC report 
+
+```{r}
+acc_qc <- qc_summary(obj, group.by = "sample")
+readr::write_csv(acc_qc, file.path(access_dir, "qc_summary_accessible.csv"))
+writeLines(qc_alt_text(obj, group.by = "sample"), con = file.path(access_dir, "qc_alt_text.txt"))
+```
+
+## QC filtering 
+
+```{r}
+qc_filter <- function(
+  obj,
+  group_by     = "sample",
+  feature_col  = "nFeature_RNA",
+  mt_col       = "percent.mt",
+  min_features = 200,
+  max_mt       = 12,
+  nmads_feat   = 3,
+  nmads_mt     = 3,
+  write_meta   = NULL  # e.g., file.path(meta_dir, "metadata_post_qc.csv")
+) {
+  md <- obj@meta.data
+  keep_idx <- rep(TRUE, ncol(obj))
+  groups <- unique(md[[group_by]])
+
+  for (g in groups) {
+    idx <- which(md[[group_by]] == g)
+    nf  <- md[[feature_col]][idx]
+    mt  <- md[[mt_col]][idx]
+
+    out_low_feat <- scater::isOutlier(log10(pmax(nf, 1)), type = "lower", nmads = nmads_feat) | (nf < min_features)
+    out_high_mt  <- scater::isOutlier(mt, type = "higher", nmads = nmads_mt) | (mt > max_mt)
+
+    keep_idx[idx] <- !(out_low_feat | out_high_mt)
+  }
+
+  obj2 <- subset(obj, cells = colnames(obj)[keep_idx])
+
+  if (!is.null(write_meta)) {
+    utils::write.csv(obj2@meta.data, write_meta, row.names = TRUE)
+  }
+
+  obj2
+}
+
+obj <- qc_filter(obj, write_meta = file.path(meta_dir, "metadata_post_qc.csv"))
+```
+
+## Violin plots (post-QC)
+
+```{r}
+p_vln_post <- VlnPlot(
+  obj,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"),
+  group.by = "sample",
+  pt.size  = 0,
+  ncol     = 2
+)
+save_both(p_vln_post, file.path(plots_dir, "qc_violin_post"), width = 16, height = 9, dpi = 600)
+```
+
+## Scatter plots (post-QC)
+
+```{r}
+p1 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+p2 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.mt")
+p_scatter_post <- p1 + p2
+save_both(p_scatter_post, file.path(plots_dir, "qc_scatter_post"), width = 16, height = 9, dpi = 600)
+```
+
+## Doublet removal 
+
+```{r}
+doublet_filter <- function(
+  obj,
+  group_by      = "sample",
+  assay         = "RNA",
+  remove        = TRUE,
+  write_meta    = NULL,   # e.g., file.path(meta_dir, "metadata_post_doublet.csv")
+  write_calls   = NULL,   # e.g., file.path(access_dir, "doublet_calls.csv")
+  write_summary = NULL    # e.g., file.path(access_dir, "doublet_summary.csv")
+) {
+  
+  sce <- as.SingleCellExperiment(obj, assay = assay)
+  grp <- SummarizedExperiment::colData(sce)[[group_by]]
+  sce <- scDblFinder::scDblFinder(sce, samples = grp, verbose = FALSE)
+
+  # Extract calls aligned to Seurat column order
+  calls <- as.data.frame(SummarizedExperiment::colData(sce))[
+    , c("scDblFinder.class", "scDblFinder.score"), drop = FALSE
+  ]
+  calls$cell   <- rownames(calls)
+  calls$sample <- grp
+  calls <- calls[match(colnames(obj), calls$cell), , drop = FALSE]
+
+  # Attach to Seurat meta.data
+  obj$doublet_class <- calls$scDblFinder.class
+  obj$doublet_score <- calls$scDblFinder.score
+
+  obj2 <- if (remove) {
+    subset(obj, cells = colnames(obj)[obj$doublet_class == "singlet"])
+  } else obj
+
+  if (!is.null(write_meta))   utils::write.csv(obj2@meta.data, write_meta, row.names = TRUE)
+  if (!is.null(write_calls))  readr::write_csv(calls, write_calls)
+
+  if (!is.null(write_summary)) {
+    sum_df <- dplyr::as_tibble(calls) |>
+      dplyr::group_by(sample) |>
+      dplyr::summarise(
+        cells = dplyr::n(),
+        n_doublet = sum(scDblFinder.class == "doublet", na.rm = TRUE),
+        pct_doublet = 100 * n_doublet / cells,
+        .groups = "drop"
+      )
+    readr::write_csv(sum_df, write_summary)
+  }
+
+  obj2
+}
+
+obj <- doublet_filter(
+  obj,
+  group_by      = "sample",
+  assay         = "RNA",
+  remove        = TRUE,
+  write_meta    = file.path(meta_dir,   "metadata_post_doublet.csv"),
+  write_calls   = file.path(access_dir, "doublet_calls.csv"),
+  write_summary = file.path(access_dir, "doublet_summary.csv")
+)
+```
+
+## Normalization via SCTransform (v2 + glmGamPoi)
+
+```{r}
+DefaultAssay(obj) <- "RNA"
+obj <- SCTransform(
+  object               = obj,
+  vst.flavor           = "v2",
+  method               = "glmGamPoi",
+  variable.features.n  = 2000,
+  vars.to.regress      = "percent.mt",
+  verbose              = FALSE
+)
+DefaultAssay(obj) <- "SCT"
+```
+
+## Dimensionality reduction placeholder (add later)
+
+```{r}
+# (Add PCA/UMAP/Harmony here as needed)
+# Example (Seurat v5-compatible):
+# obj <- RunPCA(obj, assay = "SCT")
+# obj <- RunUMAP(obj, dims = 1:30)
+# obj <- FindNeighbors(obj, dims = 1:30)
+# obj <- FindClusters(obj, resolution = 0.2)
+```
+
+## run PCA
+
+```{r}
+# placeholder for explicit PCA step, if desired
+``` 
+---
+title: "scRNASeq analysis for Steffi - PBMCs"
+author: "Jacky K"
 format:
   html:
     toc: true
@@ -13,60 +464,84 @@ execute:
   message: true
 ---
 
-## 0) Environment
+## Overview
+
+
 
 ```{r}
-rm(list = ls())
-set.seed(156)
+suppressPackageStartupMessages({
+  if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+  library(pacman)
+})
 
-# Deterministic execution
-if (!requireNamespace("future", quietly = TRUE)) install.packages("future")
-future::plan("sequential")
-options(future.globals.maxSize = 110 * 1024^3)
-```
- 
-## 1) Packages
+# CRAN + Bioconductor package management
+options(repos = c(CRAN = "https://cran.r-project.org"))
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
 
-```{r}
-if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
-library(pacman)
-
+# Load (and install if needed) packages
 pacman::p_load(
-  Seurat, SeuratObject, Matrix,
-  tidyverse, patchwork,
-  SingleCellExperiment, scater, scuttle, scDblFinder,
-  harmony,
-  svglite
-)
+  Seurat, 
+  SeuratObject,
+  tidyverse, 
+  patchwork,        
+  future,                      
+  harmony,                     
+  SingleCellExperiment,        
+  svglite)
 
-# Optional on-disk backends
-use_bpcells   <- requireNamespace("BPCells", quietly = TRUE)
-use_hdf5array <- requireNamespace("HDF5Array", quietly = TRUE) && requireNamespace("DelayedArray", quietly = TRUE)
+# Bioc packages (install if missing)
+if (!requireNamespace("scater", quietly = TRUE)) BiocManager::install("scater", ask = FALSE, update = FALSE)
+if (!requireNamespace("scDblFinder", quietly = TRUE)) BiocManager::install("scDblFinder", ask = FALSE, update = FALSE)
 
-theme_set(ggplot2::theme_minimal(base_size = 14))
+library(scater)
+library(scDblFinder)
+
+set.seed(156)                                   # Reproducibility
+
+future::plan("sequential")                      # Deterministic
+options(future.globals.maxSize = 110 * 1024^3)  
+theme_set(theme_minimal(base_size = 14))
 ```
 
-## 2) Paths & helpers
+## 2) Paths, project folders, and helpers
 
 ```{r}
-# I/O
-h5_dir      <- "/home/jacky/scRNASeq_Steffi/data/matrices"
-project_dir <- "/home/jacky/scRNASeq_Steffi/analysis_outputs"
+# Input & project name
+input_dir <- "/home/jacky/scRNASeq_Steffi/data"
+project   <- "pbmcs_steffi"
 
-dirs <- c("tables","rds","plots","logs")
-invisible(lapply(dirs, function(d) dir.create(file.path(project_dir, d), recursive = TRUE, showWarnings = FALSE)))
+# Output roots
+out_root  <- "/home/jacky/scRNASeq_Steffi/analysis"
+out_dir   <- file.path(out_root, project)
+plots_dir <- file.path(out_dir, "plots")
+meta_dir  <- file.path(out_dir, "metadata")
+rds_dir   <- file.path(out_dir, "rds")
 
-meta_dir  <- file.path(project_dir, "tables")
-rds_dir   <- file.path(project_dir, "rds")
-plots_dir <- file.path(project_dir, "plots")
+dir.create(out_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(plots_dir,recursive = TRUE, showWarnings = FALSE)
+dir.create(meta_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(rds_dir,  recursive = TRUE, showWarnings = FALSE)
 
+# Helper: fail fast with message
 stop_quiet <- function(cond, msg) { if (!isTRUE(cond)) stop(msg, call. = FALSE) }
 
+# Helper: parse donor/condition from DONOR_CONDITION_*.h5
+parse_info <- function(fp) {
+  bn    <- basename(fp)
+  core  <- tools::file_path_sans_ext(bn)
+  parts <- strsplit(core, "_", fixed = TRUE)[[1]]
+  donor <- dplyr::na_if(parts[1], "")
+  condition <- if (length(parts) >= 2) parts[2] else NA_character_
+  tibble::tibble(file = fp, sample = core, donor = donor, condition = condition)
+}
+
+# Helper: save plot as PNG and SVG (600 dpi for PNG)
 save_both <- function(plot_obj, filebase, width = 10, height = 7, dpi = 600) {
   ggplot2::ggsave(paste0(filebase, ".png"), plot_obj, width = width, height = height, dpi = dpi)
   ggplot2::ggsave(paste0(filebase, ".svg"), plot_obj, width = width, height = height, dpi = dpi)
 }
 
+# Helper: ensure per-resolution directory tree exists
 make_res_dirs <- function(root, res_label) {
   res_dir   <- file.path(root, paste0("res_", res_label))
   d_plots   <- file.path(res_dir, "plots")
@@ -79,193 +554,185 @@ make_res_dirs <- function(root, res_label) {
   dir.create(d_meta,    recursive = TRUE, showWarnings = FALSE)
   list(res_dir = res_dir, plots = d_plots, markers = d_markers, qc = d_qc, meta = d_meta)
 }
-
-stop_quiet(dir.exists(h5_dir), paste0("Missing h5_dir: ", h5_dir))
 ```
 
-## 3) Discover inputs
+## 3) Discover .h5 files and parse sample metadata
 
 ```{r}
-pattern_glob <- "*.h5"
-h5_files <- list.files(h5_dir, pattern = utils::glob2rx(pattern_glob), full.names = TRUE, recursive = TRUE)
-stop_quiet(length(h5_files) > 0, paste0("No .h5 files under ", h5_dir))
+h5_files <- list.files(input_dir, pattern = "*.h5$", full.names = TRUE, recursive = TRUE)
+stop_quiet(length(h5_files) > 0, paste0("No .h5 files found under ", input_dir))
 
-parse_info <- function(fp){
-  parts <- strsplit(tools::file_path_sans_ext(basename(fp)), "_", fixed = TRUE)[[1]]
-  tibble::tibble(file = fp, sample = paste0(parts[1], "_", parts[2]), donor = parts[1], condition = parts[2])
-}
 info <- purrr::map_dfr(h5_files, parse_info)
+stop_quiet(all(!is.na(info$donor)) & all(!is.na(info$condition)),
+           "Expected file naming: DONOR_CONDITION_*.h5 (e.g., NB166_il18_xxx.h5)")
 readr::write_csv(info, file.path(meta_dir, "samples_parsed.csv"))
-print(info, n = nrow(info))
+print(info)
 ```
 
-## 4) Read & merge
+## 4) Load HDF5 into Seurat objects and merge
 
 ```{r}
-objs <- lapply(seq_len(nrow(info)), function(i){
+objs <- vector("list", nrow(info))
+for (i in seq_len(nrow(info))) {
   message("Reading: ", basename(info$file[i]))
   mat <- Read10X_h5(info$file[i])
   so  <- CreateSeuratObject(counts = mat, project = info$donor[i], min.cells = 3, min.features = 200)
   so$sample    <- info$sample[i]
   so$donor     <- info$donor[i]
   so$condition <- info$condition[i]
-  colnames(so) <- paste(info$sample[i], colnames(so), sep = "_")
-  so
-})
-
+  colnames(so) <- paste(info$sample[i], colnames(so), sep = "_")  # stable IDs
+  objs[[i]]    <- so
+}
 stop_quiet(length(objs) > 0, "No Seurat objects created.")
 obj <- Reduce(function(a, b) merge(a, b), objs)
-obj <- JoinLayers(obj, assay = "RNA")  # ensure single counts layer
-saveRDS(obj, file.path(rds_dir, "00_merged_raw.rds"))
+stop_quiet(inherits(obj, "Seurat"), "Merged object is not Seurat.")
+
+# Save raw metadata snapshot
+utils::write.csv(obj@meta.data, file.path(meta_dir, "metadata_raw.csv"))
+dim(obj)
 ```
 
-## 5) QC
+## 5) QC metrics (mito/ribo) & initial plots
 
 ```{r}
 DefaultAssay(obj) <- "RNA"
 obj[["percent.mt"]]   <- PercentageFeatureSet(obj, pattern = "^MT-")
 obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
 
-qc_summary <- obj@meta.data |>
-  tibble::as_tibble(rownames = "cell") |>
-  dplyr::group_by(sample, donor, condition) |>
-  dplyr::summarise(
-    cells         = dplyr::n(),
-    med_counts    = median(nCount_RNA),
-    med_genes     = median(nFeature_RNA),
-    med_percent_mt= median(percent.mt),
-    .groups = "drop"
-  )
-readr::write_csv(qc_summary, file.path(meta_dir, "qc_summary_by_sample.csv"))
+# Violin plots (by sample) for quick inspection
+p_vln_raw <- VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"),
+                     group.by = "sample", pt.size = 0.05, ncol = 2)
+save_both(p_vln_raw, file.path(plots_dir, "qc_violin_raw"), width = 14, height = 9)
 
-p_vln <- VlnPlot(
-  obj, features = c("nFeature_RNA","nCount_RNA","percent.mt","percent.ribo"),
-  group.by = "sample", pt.size = 0.05, ncol = 2
-)
-save_both(p_vln, file.path(plots_dir, "qc_violin_raw"), width = 14, height = 9)
-
-p_sc1 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
-p_sc2 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.mt")
-save_both(p_sc1 + p_sc2, file.path(plots_dir, "qc_scatter_raw"), width = 12, height = 6)
+# Scatter overview
+p_scatter_raw <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+                 FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.mt")
+save_both(p_scatter_raw, file.path(plots_dir, "qc_scatter_raw"), width = 12, height = 6)
 ```
 
-## 6) Optional on-disk backend
+## 6) Data-driven QC filtering with scater::isOutlier (+ guardrails)
 
 ```{r}
-if (use_bpcells) {
-  counts <- SeuratObject::LayerData(obj[["RNA"]], layer = "counts")
-  bp_dir <- file.path(project_dir, "bp_backend", "RNA_counts")
-  dir.create(bp_dir, recursive = TRUE, showWarnings = FALSE)
-  if ("write_matrix" %in% getNamespaceExports("BPCells")) {
-    bp_counts <- BPCells::write_matrix(counts, dir = bp_dir, name = "counts")
-    obj[["RNA"]] <- SeuratObject::SetAssayData(obj[["RNA"]], layer = "counts", new.data = bp_counts)
-  }
-} else if (use_hdf5array) {
-  library(HDF5Array); library(DelayedArray); library(rhdf5)
-  counts  <- SeuratObject::LayerData(obj[["RNA"]], layer = "counts")
-  h5_path <- file.path(project_dir, "HDF5_backend_counts.h5")
-  if (file.exists(h5_path)) { try({ rhdf5::h5closeAll() }, silent = TRUE); unlink(h5_path) }
-  counts_h5 <- HDF5Array::writeHDF5Array(counts, filepath = h5_path, name = "counts",
-                                         chunkdim = pmin(dim(counts), c(1000,1000)))
-  obj[["RNA"]] <- SeuratObject::SetAssayData(obj[["RNA"]], layer = "counts", new.data = counts_h5)
+# Convert to SCE for data-driven outlier detection
+sce <- as.SingleCellExperiment(obj, assay = "RNA")
+colData(sce)$nFeature_RNA <- obj$nFeature_RNA
+colData(sce)$nCount_RNA   <- obj$nCount_RNA
+colData(sce)$percent.mt   <- obj$percent.mt
+colData(sce)$percent.ribo <- obj$percent.ribo
+
+# Per-sample robust thresholds
+by_sample <- split(seq_len(ncol(sce)), obj$sample)
+keep_idx <- rep(TRUE, ncol(sce))
+
+for (s in names(by_sample)) {
+  idx <- by_sample[[s]]
+  # Define outliers: low features / high mito
+  out_low_feat <- isOutlier(colData(sce)$nFeature_RNA[idx], type = "lower", log = TRUE, nmads = 3)
+  out_high_mt  <- isOutlier(colData(sce)$percent.mt[idx], type = "higher", nmads = 3)
+  # Guardrails
+  out_high_mt  <- out_high_mt | (colData(sce)$percent.mt[idx] > 12)
+  out_low_feat <- out_low_feat | (colData(sce)$nFeature_RNA[idx] < 200)
+  keep_idx[idx] <- !(out_low_feat | out_high_mt)
 }
+message("Retaining cells: ", sum(keep_idx), " / ", length(keep_idx))
+obj <- subset(obj, cells = colnames(obj)[keep_idx])
+stop_quiet(ncol(obj) > 0, "All cells filtered out; adjust QC thresholds.")
+
+# Post-QC snapshot
+utils::write.csv(obj@meta.data, file.path(meta_dir, "metadata_post_qc.csv"))
+p_vln_post <- VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"),
+                      group.by = "sample", pt.size = 0.05, ncol = 2)
+save_both(p_vln_post, file.path(plots_dir, "qc_violin_postQC"), width = 14, height = 9)
 ```
 
-## 7) Doublets
+## 7) Doublet detection with scDblFinder (per sample)
 
 ```{r}
+# Run per-sample to avoid cross-sample confounding
 split_objs <- SplitObject(obj, split.by = "sample")
-
-singlets_list <- list()
-dbl_calls_all <- list()
+dbl_calls <- list()
+clean_list <- list()
 
 for (nm in names(split_objs)) {
-  so  <- split_objs[[nm]]
-  sce <- as.SingleCellExperiment(so, assay = "RNA") # raw counts
-  sce <- scuttle::addPerCellQC(sce, subsets = list(Mt = grepl("^MT-", rownames(sce))))
-  sce <- scDblFinder::scDblFinder(sce, samples = NULL, verbose = FALSE)
-  calls <- as.data.frame(SummarizedExperiment::colData(sce))[, c("scDblFinder.class","scDblFinder.score")]
+  so <- split_objs[[nm]]
+  sce <- as.SingleCellExperiment(so, assay = "RNA")  # use raw counts
+  sce <- scDblFinder(sce, samples = NULL, verbose = FALSE)
+  calls <- as.data.frame(colData(sce))[, c("scDblFinder.class", "scDblFinder.score")]
   calls$cell <- rownames(calls)
-  dbl_calls_all[[nm]] <- calls
+  dbl_calls[[nm]] <- calls
   so$doublet_class <- calls$scDblFinder.class
   so$doublet_score <- calls$scDblFinder.score
-  singlets_list[[nm]] <- subset(so, subset = doublet_class == "singlet")
+  clean_list[[nm]] <- subset(so, subset = doublet_class == "singlet")
 }
 
-obj <- Reduce(function(a, b) merge(a, b), singlets_list)
-obj <- JoinLayers(obj, assay = "RNA")  # re-join after merge
-
-readr::write_csv(dplyr::bind_rows(dbl_calls_all, .id = "sample"),
-                 file.path(meta_dir, "doublet_scores_per_sample.csv"))
-
-saveRDS(obj, file.path(rds_dir, "01_after_doublets.rds"))
+obj <- Reduce(function(a,b) merge(a,b), clean_list)
+utils::write.csv(obj@meta.data, file.path(meta_dir, "metadata_post_doublet.csv"))
+message("Cells after doublet removal: ", ncol(obj))
 ```
 
-## 8) SCTransform v2
+## 8) SCTransform v2 normalization
 
 ```{r}
 DefaultAssay(obj) <- "RNA"
 obj <- SCTransform(
   object = obj,
   vst.flavor = "v2",
-  variable.features.n = 3000,
+  variable.features.n = 2000,
   vars.to.regress = "percent.mt",
   method = "glmGamPoi",
   verbose = TRUE
 )
-stop_quiet(DefaultAssay(obj) == "SCT", "SCT not set as default after SCTransform")
-saveRDS(obj, file.path(rds_dir, "02_sct.rds"))
+stop_quiet(DefaultAssay(obj) == "SCT", "SCT assay not set as default after SCTransform.")
+stop_quiet(all(c("counts","data") %in% names(obj[["SCT"]]@layers)), "SCT layered assay missing expected layers.")
 ```
 
-## 9) PCA
+## 9) PCA and elbow plot
 
 ```{r}
 obj <- RunPCA(obj, npcs = 50, verbose = FALSE)
-stop_quiet("pca" %in% names(obj@reductions), "PCA reduction missing")
+stop_quiet("pca" %in% names(obj@reductions), "PCA reduction missing.")
 
 p_elbow <- ElbowPlot(obj) + labs(title = "PCA Elbow Plot")
 save_both(p_elbow, file.path(plots_dir, "PCA_ElbowPlot"), width = 10, height = 6)
 ```
 
-## 10) Harmony
+## 10) Harmony integration on donor
 
 ```{r}
-stop_quiet("donor" %in% colnames(obj@meta.data), "Metadata lacks 'donor' column")
-
-obj <- harmony::RunHarmony(
+stop_quiet("donor" %in% colnames(obj@meta.data), "Metadata lacks 'donor' column.")
+obj <- RunHarmony(
   object        = obj,
   group.by.vars = "donor",
   reduction     = "pca",
-  dims.use      = 1:40,
-  assay.use     = DefaultAssay(obj),
+  dims.use      = 1:50,
   verbose       = TRUE
 )
-stop_quiet("harmony" %in% names(obj@reductions), "Harmony reduction missing")
-saveRDS(obj, file.path(rds_dir, "03_after_harmony.rds"))
+stop_quiet("harmony" %in% names(obj@reductions), "Harmony reduction missing.")
 ```
 
-## 11) UMAP + clustering
+## 11) UMAP, neighbors, and clustering (multi-resolution)
 
 ```{r}
 dims_use <- 1:30
 obj <- RunUMAP(obj, reduction = "harmony", dims = dims_use)
 obj <- FindNeighbors(obj, reduction = "harmony", dims = dims_use, k.param = 30)
 
+# Store multiple resolutions
 resolutions <- c(0.1, 0.2, 0.5, 0.7, 1.0)
 for (r in resolutions) {
   obj <- FindClusters(obj, resolution = r, algorithm = 4)  # Leiden
   nm <- paste0("seurat_clusters_res.", r)
   obj@meta.data[[nm]] <- Idents(obj)
 }
-saveRDS(obj, file.path(rds_dir, "04_postIntegration_allRes.rds"))
 ```
 
-## 12) Per-resolution outputs
+## 12) Per-resolution outputs: UMAPs, markers, heatmaps, dotplots, QC copies, metadata
 
 ```{r}
 DefaultAssay(obj) <- "SCT"
 
-immune_panel <- c(
+# Selected immune panel (edit as needed)
+panel <- c(
   "CCR7","IL7R","LEF1","TCF7","LTB",
   "CD3D","CD3E","CD3G","CD4","TBX21","CXCR3","IL12RB2","CCR5",
   "GATA3","CCR4","PTGDR2","RORC","CCR6","IL23R","IL2RA","FOXP3","CTLA4",
@@ -277,20 +744,16 @@ immune_panel <- c(
   "IL3RA","CLEC4C","TCF4"
 )
 
-copy_global_plots <- function(dirs) {
-  for (base in c("qc_violin_raw","qc_scatter_raw","PCA_ElbowPlot")) {
-    for (ext in c(".png",".svg")) {
-      src <- file.path(plots_dir, paste0(base, ext))
-      dest <- if (base == "PCA_ElbowPlot") file.path(dirs$plots, paste0(base, ext)) else file.path(dirs$qc, paste0(base, ext))
-      if (file.exists(src)) file.copy(src, dest, overwrite = TRUE)
-    }
-  }
-}
+# Loop over resolutions and write outputs to subfolders
+resolutions <- c(0.1, 0.2, 0.5, 0.7, 1.0)
+for (r in resolutions) {
+  res_lab <- as.character(r)
+  dirs <- make_res_dirs(out_dir, res_lab)
 
-for (r in c(0.1, 0.2, 0.5, 0.7, 1.0)) {
-  dirs <- make_res_dirs(project_dir, as.character(r))
+  # Set identities
   Idents(obj) <- obj@meta.data[[paste0("seurat_clusters_res.", r)]]
 
+  # UMAPs
   p_umap_clusters <- DimPlot(obj, reduction = "umap", group.by = paste0("seurat_clusters_res.", r),
                              label = TRUE, repel = TRUE) + ggtitle(paste0("UMAP (res=", r, ")"))
   p_umap_sample   <- DimPlot(obj, reduction = "umap", group.by = "sample") + ggtitle("UMAP by sample")
@@ -301,49 +764,73 @@ for (r in c(0.1, 0.2, 0.5, 0.7, 1.0)) {
   save_both(p_umap_sample,   file.path(dirs$plots, paste0("UMAP_by_sample_res", r)), width = 8, height = 6)
   save_both(p_umap_split,    file.path(dirs$plots, paste0("UMAP_split_by_sample_res", r)), width = 14, height = 7)
 
-  markers <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  # Markers per resolution
+  markers <- FindAllMarkers(
+    obj,
+    only.pos        = TRUE,
+    min.pct         = 0.25,
+    logfc.threshold = 0.25
+  )
   readr::write_csv(markers, file.path(dirs$markers, paste0("cluster_markers_res", r, ".csv")))
 
+  # Heatmap: top markers per cluster (top 10 by avg_log2FC)
   top_markers <- markers |>
-    dplyr::group_by(cluster) |>
-    dplyr::slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) |>
-    dplyr::pull(gene) |>
+    group_by(cluster) |>
+    slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) |>
+    pull(gene) |>
     unique()
 
+  # DoHeatmap can be heavy; limit to variable features present
   p_heat <- tryCatch({
     DoHeatmap(obj, features = top_markers, raster = FALSE) + ggtitle(paste0("Top markers heatmap (res=", r, ")"))
   }, error = function(e) {
     message("DoHeatmap failed at res=", r, " with: ", e$message)
-    ggplot2::ggplot() + ggtitle(paste0("Heatmap unavailable at res=", r))
+    ggplot() + ggtitle(paste0("Heatmap unavailable at res=", r))
   })
   save_both(p_heat, file.path(dirs$plots, paste0("Heatmap_top10_markers_res", r)), width = 12, height = 10)
 
-  p_dot <- DotPlot(obj, features = immune_panel) +
-           ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1)) +
-           ggtitle(paste0("Selected immune markers (res=", r, ")"))
+  # DotPlot for selected panel
+  p_dot <- DotPlot(obj, features = panel) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+          ggtitle(paste0("Selected immune markers (res=", r, ")"))
   save_both(p_dot, file.path(dirs$plots, paste0("DotPlot_selected_markers_res", r)), width = 14, height = 10)
 
+  # Proportions by donor/condition
   meta_res <- obj@meta.data |>
-    dplyr::mutate(cluster = as.character(.data[[paste0("seurat_clusters_res.", r)]]))
+    dplyr::mutate(cluster = as.character(obj@meta.data[[paste0("seurat_clusters_res.", r)]]))
   prop_tbl <- meta_res |>
-    dplyr::count(donor, condition, cluster, name = "cells") |>
-    dplyr::group_by(donor, condition) |>
-    dplyr::mutate(prop = cells / sum(cells)) |>
-    dplyr::ungroup()
+    count(donor, condition, cluster, name = "cells") |>
+    group_by(donor, condition) |>
+    mutate(prop = cells / sum(cells)) |>
+    ungroup()
   readr::write_csv(prop_tbl, file.path(dirs$meta, paste0("proportions_by_donor_condition_res", r, ".csv")))
-  utils::write.csv(meta_res, file.path(dirs$meta, paste0("metadata_res", r, ".csv")), row.names = TRUE)
 
-  copy_global_plots(dirs)
+  # Metadata dump (includes cluster column for this res)
+  meta_dump <- meta_res
+  utils::write.csv(meta_dump, file.path(dirs$meta, paste0("metadata_res", r, ".csv")), row.names = TRUE)
+
+  # Copy QC & Elbow into each res folder for convenience
+  qc_srcs <- c("qc_violin_raw", "qc_scatter_raw", "qc_violin_postQC")
+  for (base in qc_srcs) {
+    for (ext in c(".png",".svg")) {
+      src <- file.path(plots_dir, paste0(base, ext))
+      if (file.exists(src)) file.copy(src, file.path(dirs$qc, paste0(base, ext)), overwrite = TRUE)
+    }
+  }
+  for (ext in c(".png",".svg")) {
+    src <- file.path(plots_dir, paste0("PCA_ElbowPlot", ext))
+    if (file.exists(src)) file.copy(src, file.path(dirs$plots, paste0("PCA_ElbowPlot_res", r, ext)), overwrite = TRUE)
+  }
 }
 ```
 
-## 13) Save & session info
+## 13) Save final object and session info
 
 ```{r}
-saveRDS(obj, file.path(rds_dir, "04_final_object_multiRes.rds"))
-writeLines(capture.output(sessionInfo()), con = file.path(project_dir, "sessionInfo_full.txt"))
-cat("\\n✅ Done. Outputs in: ", project_dir,
-    "\\n- rds/: 00_merged_raw.rds → 04_final_object_multiRes.rds",
-    "\\n- tables/: parsed samples, QC summaries, doublet calls, proportions per res",
-    "\\n- res_*/: per-resolution plots (PNG+SVG, 600 dpi), markers, metadata\\n", sep = "")
+saveRDS(obj, file.path(rds_dir, paste0(project, ".rds")))
+
+# Session info is invaluable for reproducibility
+si <- utils::capture.output(sessionInfo())
+writeLines(si, con = file.path(out_dir, "sessionInfo.txt"))
+
+cat("\nDone. Outputs written to: ", out_dir, "\nPer-resolution folders created: res_0.1, res_0.2, res_0.5, res_0.7, res_1.0\n", sep = "")
 ```
