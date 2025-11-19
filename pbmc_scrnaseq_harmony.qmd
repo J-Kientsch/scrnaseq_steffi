@@ -76,7 +76,7 @@ save_both <- function(plot_obj, filebase, width = 16, height = 9, dpi = 600, bg 
 
 ```{r}
 h5_dir      <- "/home/jacky/scRNASeq_Steffi/filtered_matrices"
-project_dir <- "/home/jacky/scRNASeq_Steffi/analysis_outputs_downsample1000_4"
+project_dir <- "/home/jacky/scRNASeq_Steffi/analysis_outputs_downsample1000_5"
 
 for (d in c("tables","rds","plots","logs")) dir.create(file.path(project_dir, d), recursive = TRUE, showWarnings = FALSE)
 meta_dir  <- file.path(project_dir, "tables")
@@ -117,7 +117,7 @@ stop_quiet(dir.exists(h5_dir), paste0("Missing h5_dir: ", h5_dir))
 ## 3) Discover inputs
 
 ```{r}
-h5_files <- list.files(h5_dir, pattern = "\.h5$", full.names = TRUE, recursive = TRUE)
+h5_files <- list.files(h5_dir, pattern = "*.h5$", full.names = TRUE, recursive = TRUE)
 stop_quiet(length(h5_files) > 0, paste0("No .h5 files under ", h5_dir))
 
 parse_info <- function(fp){
@@ -235,11 +235,9 @@ p_sc2 <- FeatureScatter(
 save_both(p_sc1 + p_sc2, file.path(plots_dir, "qc_scatter_raw_labeled"))
 ```
 
-## 6) On-disk backend (optional)
+## 6) On-disk backend 
 
 ```{r}
-## 6) On-disk backend (BPCells or HDF5Array), but keep an in-memory dgCMatrix copy for SingleR
-
 # Extract original counts BEFORE converting to BPCells
 counts_raw <- SeuratObject::LayerData(obj[["RNA"]], layer = "counts")
 
@@ -483,32 +481,42 @@ obj <- FindNeighbors(obj, reduction = "harmony", dims = dims_use,
 ## 13) Clustering & marker plots per resolution (0.1, 0.2, 0.5)
 
 ```{r}
-## 13) Clustering & marker plots per resolution (0.1, 0.2, 0.5)
 DefaultAssay(obj) <- "SCT"
 
 .ensure_harmony_nn_umap <- function(x) {
-  if (!"harmony" %in% names(x@reductions))
+  if (!"harmony" %in% names(x@reductions)) {
     stop("Harmony reduction missing; run ## 11 first.", call. = FALSE)
+  }
 
   dims_use <- base::seq_len(base::min(30, ncol(Embeddings(x, "harmony"))))
 
   if (!"harmony_nn" %in% names(x@graphs)) {
-    x <- FindNeighbors(x, reduction = "harmony", dims = dims_use,
-                       k.param = 30, graph.name = "harmony_nn", verbose = FALSE)
+    x <- FindNeighbors(
+      x, reduction = "harmony", dims = dims_use,
+      k.param = 30, graph.name = "harmony_nn", verbose = FALSE
+    )
   }
+
   if (!"umap_harmony" %in% names(x@reductions)) {
-    x <- RunUMAP(x, reduction = "harmony", dims = dims_use,
-                 n.neighbors = 30, min.dist = 0.3, seed.use = 156,
-                 umap.method = "uwot", metric = "cosine",
-                 return.model = FALSE, reduction.name = "umap_harmony")
+    x <- RunUMAP(
+      x, reduction = "harmony", dims = dims_use,
+      n.neighbors = 30, min.dist = 0.3, seed.use = 156,
+      umap.method = "uwot", metric = "cosine",
+      return.model = FALSE, reduction.name = "umap_harmony"
+    )
   }
+
   x
 }
 
 cluster_one_resolution <- function(x, r, algo) {
   x <- .ensure_harmony_nn_umap(x)
-  x <- FindClusters(x, graph.name = "harmony_nn", resolution = r,
-                    algorithm = algo, verbose = FALSE)
+
+  # clustering
+  x <- FindClusters(
+    x, graph.name = "harmony_nn",
+    resolution = r, algorithm = algo, verbose = FALSE
+  )
 
   cl_col <- sprintf("seurat_clusters_res.%s", r)
   x[[cl_col]] <- factor(as.character(Idents(x)))
@@ -516,85 +524,207 @@ cluster_one_resolution <- function(x, r, algo) {
 
   dirs <- make_res_dirs(project_dir, as.character(r))
 
-  p1 <- DimPlot(x, reduction = "umap_harmony", group.by = cl_col,
-                label = TRUE, repel = TRUE, raster = TRUE, pt.size = 0.5)
-  p2 <- DimPlot(x, reduction = "umap_harmony", group.by = "sample",
-                raster = TRUE, pt.size = 0.5)
-  p3 <- DimPlot(x, reduction = "umap_harmony", split.by = "sample",
-                raster = TRUE, pt.size = 0.3)
+  ## UMAPs
+  p1 <- DimPlot(
+    x, reduction = "umap_harmony", group.by = cl_col,
+    label = TRUE, repel = TRUE, raster = TRUE, pt.size = 0.5
+  )
+  p2 <- DimPlot(
+    x, reduction = "umap_harmony", group.by = "sample",
+    raster = TRUE, pt.size = 0.5
+  )
+  p3 <- DimPlot(
+    x, reduction = "umap_harmony", split.by = "sample",
+    raster = TRUE, pt.size = 0.3
+  )
 
   save_both(p1, file.path(dirs$plots, sprintf("UMAP_clusters_res%s", r)), width = 9, height = 9)
   save_both(p2, file.path(dirs$plots, sprintf("UMAP_by_sample_res%s", r)), width = 9, height = 9)
   save_both(p3, file.path(dirs$plots, sprintf("UMAP_split_by_sample_res%s", r)), width = 9, height = 9)
 
+  ## Find markers (SCT)
+  DefaultAssay(x) <- "SCT"
   markers <- tryCatch(
-    FindAllMarkers(x, assay = "SCT", only.pos = TRUE,
-                   min.pct = 0.1, logfc.threshold = 0.15,
-                   test.use = "wilcox", max.cells.per.ident = 1000, random.seed = 156),
-    error = function(e) tibble::tibble()
+    FindAllMarkers(
+      x, assay = "SCT", only.pos = TRUE,
+      min.pct = 0.1, logfc.threshold = 0.15,
+      test.use = "wilcox", max.cells.per.ident = 1000, random.seed = 156
+    ),
+    error = function(e) {
+      warning("FindAllMarkers failed for res=", r, ": ", conditionMessage(e))
+      tibble::tibble()
+    }
   )
   readr::write_csv(markers, file.path(dirs$markers, sprintf("cluster_markers_res%s.csv", r)))
 
+  ## Top10 heatmap / dotplot per cluster
   if (nrow(markers) > 0) {
     top_markers <- markers %>%
       dplyr::group_by(cluster) %>%
       dplyr::slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) %>%
-      dplyr::ungroup() %>% dplyr::pull(gene) %>% unique()
+      dplyr::ungroup() %>%
+      dplyr::pull(gene) %>%
+      unique()
+
     hm_feats <- intersect(top_markers, rownames(x))
 
     if (length(hm_feats) >= 2) {
       suppressWarnings({
-        x <- ScaleData(x, assay = DefaultAssay(x), features = hm_feats, verbose = FALSE, clip.max = 3)
+        x <- ScaleData(
+          x, assay = DefaultAssay(x), features = hm_feats,
+          verbose = FALSE, clip.max = 3
+        )
       })
-      p_heat <- DoHeatmap(x, features = hm_feats, assay = DefaultAssay(x),
-                          slot = "scale.data", raster = TRUE)
+
+      p_heat <- DoHeatmap(
+        x, features = hm_feats, assay = DefaultAssay(x),
+        slot = "scale.data", raster = TRUE
+      )
       save_both(p_heat, file.path(dirs$plots, sprintf("Heatmap_top10_markers_res%s", r)))
 
-      p_dot <- DotPlot(x, features = hm_feats, group.by = cl_col,
-                       scale.by = "size", dot.min = 0.1) +
-               ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1))
+      p_dot <- DotPlot(
+        x, features = hm_feats, group.by = cl_col,
+        scale.by = "size", dot.min = 0.1
+      ) +
+        ggplot2::theme(
+          axis.text.x = ggplot2::element_text(angle = 90, hjust = 1)
+        )
       save_both(p_dot, file.path(dirs$plots, sprintf("DotPlot_top_markers_res%s", r)))
     }
 
+    ## Per-cluster violin plots for top 6 DE genes
     for (cl in levels(Idents(x))) {
       genes_cl <- markers %>%
         dplyr::filter(cluster == cl) %>%
         dplyr::slice_max(order_by = avg_log2FC, n = 6, with_ties = FALSE) %>%
-        dplyr::pull(gene) %>% intersect(rownames(x))
+        dplyr::pull(gene) %>%
+        intersect(rownames(x))
+
       if (length(genes_cl)) {
-        p_vln <- VlnPlot(x, features = genes_cl, group.by = cl_col,
-                         pt.size = 0, ncol = min(3, length(genes_cl)))
-        save_both(p_vln, file.path(dirs$plots,
-                 sprintf("VlnPlot_top_markers_cluster_%s_res%s", cl, r)))
+        p_vln <- VlnPlot(
+          x, features = genes_cl, group.by = cl_col,
+          pt.size = 0, ncol = min(3, length(genes_cl))
+        )
+        save_both(
+          p_vln,
+          file.path(
+            dirs$plots,
+            sprintf("VlnPlot_top_markers_cluster_%s_res%s", cl, r)
+          )
+        )
       }
     }
   }
 
-  meta_res <- x@meta.data %>% tibble::rownames_to_column("cell_id") %>%
+  ## IMMUNE PANEL: dotplot + heatmap + UMAP + violins
+  DefaultAssay(x) <- "SCT"
+  panel_feats <- intersect(immune_panel, rownames(x))
+
+  if (length(panel_feats) > 0) {
+    suppressWarnings({
+      x <- ScaleData(
+        x, assay = DefaultAssay(x),
+        features = panel_feats, verbose = FALSE, clip.max = 3
+      )
+    })
+
+    # Dotplot
+    p_panel_dot <- DotPlot(
+      x, features = panel_feats, group.by = cl_col,
+      scale.by = "size", dot.min = 0.05
+    ) +
+      ggplot2::ggtitle(sprintf("Immune marker panel — res=%s", r)) +
+      ggplot2::theme(
+        axis.text.x = ggplot2::element_text(angle = 90, hjust = 1)
+      )
+    save_both(
+      p_panel_dot,
+      file.path(dirs$plots, sprintf("DotPlot_immune_panel_res%s", r)),
+      width = 16, height = 9
+    )
+
+    # Heatmap
+    p_panel_heat <- DoHeatmap(
+      x, features = panel_feats,
+      assay = DefaultAssay(x), slot = "scale.data", raster = TRUE
+    ) +
+      ggplot2::ggtitle(sprintf("Immune marker heatmap — res=%s", r))
+    save_both(
+      p_panel_heat,
+      file.path(dirs$plots, sprintf("Heatmap_immune_panel_res%s", r)),
+      width = 16, height = 9
+    )
+
+    # Violin plots for immune panel genes
+    p_panel_vln <- VlnPlot(
+      x, features = panel_feats, group.by = cl_col,
+      pt.size = 0, ncol = min(4, length(panel_feats))
+    )
+    save_both(
+      p_panel_vln,
+      file.path(dirs$plots, sprintf("VlnPlot_immune_panel_res%s", r)),
+      width = 16, height = 9
+    )
+
+    # UMAP feature plots per immune gene
+    for (g in panel_feats) {
+      p_feat <- FeaturePlot(
+        x, features = g, reduction = "umap_harmony",
+        order = TRUE, pt.size = 0.3
+      ) +
+        ggplot2::ggtitle(sprintf("%s — res=%s", g, r))
+      safe_g <- gsub("[^A-Za-z0-9]+", "_", g)
+      save_both(
+        p_feat,
+        file.path(dirs$plots,
+                  sprintf("UMAP_immune_%s_res%s", safe_g, r)),
+        width = 9, height = 9
+      )
+    }
+  }
+
+  ## basic metadata export
+  meta_res <- x@meta.data %>%
+    tibble::rownames_to_column("cell_id") %>%
     dplyr::mutate(cluster = as.character(.data[[cl_col]]))
+
   prop_tbl <- meta_res %>%
     dplyr::count(donor, condition, cluster, name = "cells") %>%
     dplyr::group_by(donor, condition) %>%
     dplyr::mutate(prop = cells / sum(cells)) %>%
     dplyr::ungroup()
-  readr::write_csv(prop_tbl, file.path(dirs$meta, sprintf("proportions_by_donor_condition_res%s.csv", r)))
-  readr::write_csv(meta_res,  file.path(dirs$meta,  sprintf("metadata_res%s.csv", r)))
+
+  readr::write_csv(
+    prop_tbl,
+    file.path(dirs$meta, sprintf("proportions_by_donor_condition_res%s.csv", r))
+  )
+  readr::write_csv(
+    meta_res,
+    file.path(dirs$meta, sprintf("metadata_res%s.csv", r))
+  )
 
   x
 }
 
-# run
+## run clustering for the three resolutions
 obj <- cluster_one_resolution(obj, r = 0.1, algo = algo)
 saveRDS(obj, file.path(rds_dir, "04_postIntegration_res0.1.rds"))
+
 obj <- cluster_one_resolution(obj, r = 0.2, algo = algo)
 saveRDS(obj, file.path(rds_dir, "04_postIntegration_res0.2.rds"))
 obj <- cluster_one_resolution(obj, r = 0.5, algo = algo)
 saveRDS(obj, file.path(rds_dir, "04_postIntegration_res0.5.rds"))
+
 ```
+
+### annotate the crued clusters 
+
+
+
 
 ## 14) SingleR: per-cell annotations per resolution (robust with fallbacks)
 ```{r}
-# Build a SingleR-ready object:
+ # Build a SingleR-ready object:
 # - clustering, UMAP, SCT etc. from processed object (with BPCells)
 # - plain in-memory counts from the 00b object (no BPCells)
 
@@ -828,7 +958,7 @@ label_cols  <- vapply(
 )
 
 # Quick sanity check: warn if any label column is missing
-for (i in seq_along(resolutions)) {
+for (i in seq_along(resol utions)) {
   if (!label_cols[i] %in% colnames(obj@meta.data)) {
     warning(
       "Label column ", label_cols[i], " missing in metadata. ",
